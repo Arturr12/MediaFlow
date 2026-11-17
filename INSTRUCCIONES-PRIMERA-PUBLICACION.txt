@@ -1,0 +1,51 @@
+MEDIAFLOW - PRIMERA PUBLICACION EN GITHUB
+=========================================
+
+CUENTA GITHUB DETECTADA
+-----------------------
+Arturr12
+
+REPOSITORIO PROPUESTO
+---------------------
+Nombre: MediaFlow
+URL: https://github.com/Arturr12/MediaFlow
+Visibilidad: PUBLICA
+
+PASO 1 - CREAR EL REPOSITORIO
+-----------------------------
+1. Inicia sesion en GitHub.
+2. Abre https://github.com/new
+3. Owner: Arturr12
+4. Repository name: MediaFlow
+5. Description: Aplicacion de escritorio para descargas y conversion multimedia con actualizaciones automaticas.
+6. Elige Public.
+7. NO marques Add a README, Add .gitignore ni Choose a license.
+8. Haz clic en Create repository.
+
+PASO 2 - SUBIR EL CODIGO
+------------------------
+1. Instala Git for Windows si aun no lo tienes.
+2. Extrae este paquete en una carpeta local.
+3. Ejecuta PUBLICAR-EN-GITHUB.bat.
+4. Autoriza Git Credential Manager en el navegador si lo solicita.
+
+PASO 3 - PUBLICAR LA PRIMERA VERSION
+------------------------------------
+1. Cuando termine la subida del codigo, ejecuta PUBLICAR-PRIMERA-RELEASE.bat.
+2. GitHub Actions compilara el EXE y publicara v0.4.4.
+3. En GitHub abre Actions para observar el proceso.
+4. Cuando termine, abre Releases y comprueba que esten los assets .exe y mediaflow-update.json.
+
+FUTURAS VERSIONES
+-----------------
+1. Edita RELEASE_NOTES.md con las novedades.
+2. Ejecuta PUBLICAR-NUEVA-VERSION.bat.
+3. Escribe una version mayor, como 0.4.5.
+4. El script sube el codigo y la etiqueta. GitHub Actions crea la Release.
+5. MediaFlow notificara a los usuarios y solo instalara despues de su autorizacion.
+
+IMPORTANTE
+----------
+El actualizador de MediaFlow consulta un repositorio publico sin token. Por eso este
+repositorio debe ser PUBLICO. El codigo y los instaladores tambien seran visibles y
+descargables por cualquier persona.

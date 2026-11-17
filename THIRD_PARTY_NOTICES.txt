@@ -1,0 +1,38 @@
+MEDIAFLOW 0.4.2 - AVISOS DE COMPONENTES DE TERCEROS
+
+MediaFlow empaqueta sus dependencias Python (incluyendo PySide6, yt-dlp y
+yt-dlp-ejs) dentro de la distribucion creada por PyInstaller.
+
+Durante la instalacion, el asistente usa WinGet para instalar FFmpeg Essentials
+y Deno en el perfil del usuario. MediaFlow no copia ni redistribuye esos
+programas dentro de su propio instalador; se obtienen desde sus respectivos
+paquetes de WinGet en el equipo de destino.
+
+FFmpeg
+- Proyecto: https://ffmpeg.org/
+- Consideraciones legales oficiales: https://ffmpeg.org/legal.html
+- Paquetes Windows utilizados: https://www.gyan.dev/ffmpeg/builds/
+- Los paquetes estaticos Essentials de Gyan se identifican en su pagina como
+  GPLv3. El paquete y sus componentes mantienen sus licencias originales.
+
+Deno
+- Proyecto: https://deno.com/
+- Instalacion oficial: https://docs.deno.com/runtime/getting_started/installation/
+- Licencia del proyecto Deno: MIT (consultar el repositorio y distribucion
+  oficial para el texto y avisos aplicables).
+
+yt-dlp / yt-dlp-ejs
+- yt-dlp: https://github.com/yt-dlp/yt-dlp
+- yt-dlp-ejs: https://github.com/yt-dlp/ejs
+- Se incluyen como dependencias de software de terceros y conservan sus
+  respectivos avisos y licencias.
+
+El uso de componentes de terceros no implica que MediaFlow sea propietario
+de esos proyectos. Consulta los enlaces anteriores para sus licencias,
+avisos y condiciones de redistribucion.
+
+La instalacion automatica de FFmpeg y Deno necesita conexion a Internet y
+WinGet (App Installer) disponible en Windows. Si el equipo esta sin Internet
+o no tiene WinGet, MediaFlow se instala, pero algunas funciones multimedia o
+la compatibilidad completa con YouTube pueden quedar deshabilitadas hasta
+instalar esos componentes.

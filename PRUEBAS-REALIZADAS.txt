@@ -1,0 +1,11 @@
+PRUEBAS DE PREPARACION - MEDIAFLOW 0.4.3
+
+- Sintaxis Python comprobada con py_compile.
+- Verificacion de referencias de calidad, resolucion y modo FAT32.
+- Verificacion de compatibilidad de la carga de trabajos de ConvertWorker.
+- Conversiones de prueba con FFmpeg local: MP4 normal y perfiles de dos pasadas.
+- Prueba de escala sin aumento de resolucion en perfiles 1080p/720p/480p/360p.
+- Prueba de cancelacion por consulta del callback durante ejecucion.
+
+La interfaz PySide6 debe probarse en Windows con run_portable.bat. La estimacion
+FAT32 es conservadora, pero el tamaño final siempre se comprueba en el archivo.

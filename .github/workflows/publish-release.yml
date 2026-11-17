@@ -1,0 +1,67 @@
+name: Build and publish MediaFlow release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mediaflow-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Obtener el código
+        uses: actions/checkout@v4
+
+      - name: Preparar Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          architecture: 'x64'
+
+      - name: Determinar versión
+        id: version
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}' -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Versión no válida: $version. Usa el formato X.Y.Z."
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "MEDIAFLOW_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Preparar la versión en el código
+        shell: pwsh
+        run: python tools/set_version.py --version "${{ steps.version.outputs.version }}"
+
+      - name: Instalar dependencias de Python
+        run: python -m pip install --disable-pip-version-check -r requirements.txt -r requirements-build.txt
+
+      - name: Ejecutar pruebas del actualizador
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Instalar Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Compilar EXE, instalador y manifiesto
+        shell: pwsh
+        run: python tools/build_release.py --version "${{ steps.version.outputs.version }}"
+
+      - name: Publicar GitHub Release y adjuntar instalador
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $version = '${{ steps.version.outputs.version }}'
+          $tag = "v$version"
+          $installer = "Output/MediaFlow-Setup-$version.exe"
+          if (!(Test-Path $installer)) { throw "No se encontró $installer" }
+          if (!(Test-Path 'Output/mediaflow-update.json')) { throw 'No se encontró el manifiesto de actualización.' }
+          gh release create $tag $installer 'Output/mediaflow-update.json' --title "MediaFlow $version" --notes-file RELEASE_NOTES.md --verify-tag

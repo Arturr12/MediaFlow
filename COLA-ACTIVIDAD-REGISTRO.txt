@@ -1,0 +1,21 @@
+CORRECCION CRITICA: ELIMINACION DE TITULO FANTASMA
+
+En _add_download(), la primera columna necesita un QTableWidgetItem para guardar
+Qt.UserRole con el ID de la tarea, ya que la seleccion/cancelacion y el reindexado
+leen ese dato. Ese item NO debe contener el titulo visible:
+
+    title_item = QTableWidgetItem("")
+    title_item.setData(Qt.UserRole, task_id)
+    title_item.setToolTip(url)
+    self.queue_table.setItem(row, 0, title_item)
+
+El unico titulo visible se presenta dentro del QWidget DownloadQueueCell:
+
+    self.queue_table.setCellWidget(row, 0, download_cell)
+
+Cuando yt-dlp devuelve el titulo, este se guarda en el modelo de tarea y se
+actualiza DownloadQueueCell.set_title(). No se llama setText(title) sobre el
+QTableWidgetItem. Asi Qt no puede pintar un titulo debajo/detras de la miniatura.
+
+Los metadatos y los cambios de estado se actualizan exclusivamente con
+DownloadQueueCell.set_subtitle().
