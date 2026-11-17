@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-labelledby="title">
+<title id="title">MediaFlow mark</title>
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#2563eb"/><stop offset="1" stop-color="#06b6d4"/></linearGradient></defs>
+<rect x="12" y="12" width="232" height="232" rx="58" fill="url(#g)"/>
+<path d="M62 180V76h24l42 54 42-54h24v104h-27v-61l-39 49-39-49v61z" fill="#fff"/>
+<path d="M187 63l24 14-24 14z" fill="#a5f3fc"/>
+</svg>
