@@ -1,12 +1,9 @@
 name: Build MediaFlow test installer
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to package"
-        required: true
-        default: "0.5.0"
+  push:
+    branches:
+      - feature/mediaflow-music-playlists
 
 permissions:
   contents: read
@@ -32,7 +29,7 @@ jobs:
       - name: Validar versión
         shell: pwsh
         run: |
-          $version = "${{ inputs.version }}"
+          $version = "0.5.0"
           if ($version -notmatch '^\d+\.\d+\.\d+$') {
             throw "Versión no válida: $version. Usa el formato X.Y.Z."
           }
@@ -49,14 +46,14 @@ jobs:
 
       - name: Compilar EXE, instalador y manifiesto
         shell: pwsh
-        run: python tools/build_release.py --version "${{ inputs.version }}"
+        run: python tools/build_release.py --version "0.5.0"
 
       - name: Publicar instalador como artefacto de prueba
         uses: actions/upload-artifact@v4
         with:
-          name: MediaFlow-Test-${{ inputs.version }}
+          name: MediaFlow-Test-0.5.0
           path: |
-            Output/MediaFlow-Setup-${{ inputs.version }}.exe
+            Output/MediaFlow-Setup-0.5.0.exe
             Output/mediaflow-update.json
           if-no-files-found: error
           retention-days: 14
