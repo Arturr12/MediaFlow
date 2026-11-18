@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from PySide6.QtCore import Qt, QThread, QTimer, QUrl, QSize, Signal, QSignalBlocker, QSettings
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap, QColor, QPainter, QFontMetrics
@@ -2670,7 +2670,10 @@ class MediaFlowWindow(QMainWindow):
             return
         if isinstance(info, dict) and info.get("_type") == "playlist":
             entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
-            selected_id = str((info.get("requested_entries") or [{}])[0].get("id") or "")
+            parsed_url = urlparse(task.get("url", ""))
+            selected_id = parse_qs(parsed_url.query).get("v", [""])[0]
+            if not selected_id and parsed_url.netloc.lower().endswith("youtu.be"):
+                selected_id = parsed_url.path.strip("/").split("/")[0]
             dialog = PlaylistSelectionDialog(entries, selected_id, self)
             dialog.setWindowTitle(f"MediaFlow · {title}")
             chosen = dialog.exec()
