@@ -1284,9 +1284,13 @@ class DownloadPreviewWorker(QThread):
                     thumb_url,
                     headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"},
                 )
-                opener = ydl.urlopen if ydl is not None else urllib.request.urlopen
-                with opener(request, timeout=15) as response:
-                    data = response.read(4 * 1024 * 1024 + 1)
+                if ydl is not None:
+                    # yt-dlp's opener uses its own configured socket timeout.
+                    with ydl.urlopen(request) as response:
+                        data = response.read(4 * 1024 * 1024 + 1)
+                else:
+                    with urllib.request.urlopen(request, timeout=15) as response:
+                        data = response.read(4 * 1024 * 1024 + 1)
                 if data and len(data) <= 4 * 1024 * 1024:
                     return data
             except Exception:
