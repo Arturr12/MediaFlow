@@ -174,7 +174,7 @@ def safe_output_stem(stem: str, max_length: int = 110) -> str:
     """Return a Windows-safe filename stem for titles supplied by remote sites."""
     value = str(stem or "").strip()
     value = "".join("_" if ord(char) < 32 or char in '<>:"/\\\\|?*' else char for char in value)
-    value = re.sub(r"\\s+", " ", value).strip(" .")
+    value = re.sub(r"\s+", " ", value).strip(" .")
     value = value[:max_length].rstrip(" .")
     if not value:
         value = "MediaFlow"
