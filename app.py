@@ -62,6 +62,9 @@ SUPPORTED_EXTENSIONS = {
     ".aac", ".flac", ".ogg", ".opus",
 }
 OUTPUT_FORMATS = ["MP4", "MPG", "AVI", "MKV", "MP3"]
+AUDIO_OUTPUT_FORMATS = ["MP3", "FLAC", "WAV", "M4A", "AAC", "OGG", "OPUS"]
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".wma", ".aiff", ".alac"}
+MUSIC_OUTPUT_DIR = BASE_OUTPUT / "Musica"
 QUALITY_OPTIONS = ["Mejor disponible", "1080p", "720p", "480p", "360p", "Solo audio"]
 VIDEO_RESOLUTION_OPTIONS = ["Original", "1080p", "720p", "480p", "360p"]
 VIDEO_COMPRESSION_OPTIONS = ["Alta", "Equilibrada", "Compacta", "Muy compacta"]
@@ -558,6 +561,7 @@ def convert_media(
     resolution: str = "Original",
     quality: str = "Equilibrada",
     fat32_mode: bool = False,
+    audio_bitrate_kbps: int | None = None,
 ) -> None:
     """Convert with selectable resolution/quality and an optional FAT32-aware two-pass encode.
 
@@ -578,17 +582,34 @@ def convert_media(
     quality = quality if quality in VIDEO_QUALITY_SETTINGS else "Equilibrada"
     quality_settings = VIDEO_QUALITY_SETTINGS[quality]
     duration = _probe_duration(source)
-    is_audio_output = fmt == "mp3"
+    is_audio_output = fmt in {value.lower() for value in AUDIO_OUTPUT_FORMATS}
     use_fat32_target = bool(fat32_mode and not is_audio_output)
 
     base = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(source)]
     progress_args = ["-progress", "pipe:1", "-stats_period", "1", "-nostats"]
     audio_bitrate = int(quality_settings["audio_kbps"])
 
-    if fmt == "mp3":
-        video_args: list[str] = ["-vn"]
-        audio_args = ["-c:a", "libmp3lame", "-b:a", f"{audio_bitrate}k"]
+    selected_audio_bitrate = max(32, min(512, int(audio_bitrate_kbps or audio_bitrate)))
+    if is_audio_output:
+        video_args: list[str] = ["-map", "0:a:0", "-map_metadata", "0"]
+        if fmt in ("mp3", "flac", "m4a"):
+            video_args += ["-map", "0:v:m:attached_pic?"]
         format_args: list[str] = []
+        if fmt == "mp3":
+            audio_args = ["-c:a", "libmp3lame", "-b:a", f"{selected_audio_bitrate}k", "-c:v", "copy", "-id3v2_version", "3"]
+        elif fmt == "flac":
+            audio_args = ["-c:a", "flac", "-compression_level", "8", "-c:v", "copy"]
+        elif fmt == "wav":
+            audio_args = ["-c:a", "pcm_s16le"]
+        elif fmt == "m4a":
+            audio_args = ["-c:a", "aac", "-b:a", f"{selected_audio_bitrate}k", "-c:v", "copy"]
+        elif fmt == "aac":
+            audio_args = ["-c:a", "aac", "-b:a", f"{selected_audio_bitrate}k"]
+            format_args = ["-f", "adts"]
+        elif fmt == "ogg":
+            audio_args = ["-c:a", "libvorbis", "-q:a", "5"]
+        elif fmt == "opus":
+            audio_args = ["-c:a", "libopus", "-b:a", f"{selected_audio_bitrate}k"]
     elif fmt in ("mp4", "mkv", "mpg", "avi"):
         video_args = ["-map", "0:v:0", "-sn", "-dn", "-threads", "0"]
         audio_args = ["-map", "0:a:0?", "-c:a"]
@@ -706,8 +727,8 @@ def convert_media(
                     "No pude detectar la duración del video para calcular el tamaño FAT32. "
                     "Desactiva la optimización FAT32 o vuelve a comprobar el archivo."
                 )
-            if fmt == "mp3":
-                raise RuntimeError("La optimización FAT32 de video no se aplica a archivos MP3.")
+            if is_audio_output:
+                raise RuntimeError("La optimización FAT32 no se aplica a archivos de audio.")
 
             target_gib = float(quality_settings["fat32_gib"])
             target_bytes = int(target_gib * (1024 ** 3))
@@ -1276,13 +1297,14 @@ class ConvertWorker(QThread):
     fileSucceeded = Signal(str, str)
     fileFailed = Signal(str, str)
 
-    def __init__(self, jobs: list[tuple[Path, str, str, str, bool]], output_dir: Path):
+    def __init__(self, jobs: list[tuple[Path, str, str, str, bool]], output_dir: Path, audio_bitrate_kbps: int | None = None):
         super().__init__()
         self.jobs = [
             (Path(source), str(output_format).lower(), str(resolution), str(quality), bool(fat32_mode))
             for source, output_format, resolution, quality, fat32_mode in jobs
         ]
         self.output_dir = output_dir
+        self.audio_bitrate_kbps = audio_bitrate_kbps
         self._cancel_lock = threading.Lock()
         self._cancelled_paths: set[str] = set()
         self._finished_paths: set[str] = set()
@@ -1359,6 +1381,7 @@ class ConvertWorker(QThread):
                     resolution=resolution,
                     quality=quality,
                     fat32_mode=fat32_mode,
+                    audio_bitrate_kbps=self.audio_bitrate_kbps,
                 )
                 results.append(str(destination))
                 self.fileSucceeded.emit(str(source), str(destination))
@@ -1408,6 +1431,8 @@ class MediaFlowWindow(QMainWindow):
         self.preview_worker: DownloadPreviewWorker | None = None
         self.preview_queue: list[str] = []
         self.conversion_worker: ConvertWorker | None = None
+        self.music_worker: ConvertWorker | None = None
+        self.music_files: list[Path] = []
         self.folder_scan_worker: FolderScanWorker | None = None
         self.thumbnail_worker: ThumbnailWorker | None = None
         self.thumbnail_pending: list[Path] = []
@@ -1480,10 +1505,14 @@ class MediaFlowWindow(QMainWindow):
         self.download_nav_button.setObjectName("navButton")
         self.download_nav_button.setCheckable(True)
         self.download_nav_button.setChecked(True)
+        self.music_nav_button = QPushButton("♫  Música")
+        self.music_nav_button.setObjectName("navButton")
+        self.music_nav_button.setCheckable(True)
         self.convert_nav_button = QPushButton("▣  Convertir local")
         self.convert_nav_button.setObjectName("navButton")
         self.convert_nav_button.setCheckable(True)
         nav_layout.addWidget(self.download_nav_button)
+        nav_layout.addWidget(self.music_nav_button)
         nav_layout.addWidget(self.convert_nav_button)
         header.addWidget(nav_group, 0, Qt.AlignVCenter)
         header.addStretch(1)
@@ -1519,10 +1548,12 @@ class MediaFlowWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.setMovable(False)
         self.tabs.addTab(self._build_download_page(), "Descargar")
+        self.tabs.addTab(self._build_music_page(), "Música")
         self.tabs.addTab(self._build_convert_page(), "Convertir local")
         self.tabs.tabBar().hide()
         self.download_nav_button.clicked.connect(lambda: self.tabs.setCurrentIndex(0))
-        self.convert_nav_button.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
+        self.music_nav_button.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
+        self.convert_nav_button.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
         self.tabs.currentChanged.connect(self._sync_navigation_buttons)
         outer.addWidget(self.tabs, 1)
 
@@ -1539,7 +1570,8 @@ class MediaFlowWindow(QMainWindow):
 
     def _sync_navigation_buttons(self, index: int) -> None:
         self.download_nav_button.setChecked(index == 0)
-        self.convert_nav_button.setChecked(index == 1)
+        self.music_nav_button.setChecked(index == 1)
+        self.convert_nav_button.setChecked(index == 2)
 
     # ------------------------------------------------------------------
     # GitHub Releases updater
@@ -2057,6 +2089,202 @@ class MediaFlowWindow(QMainWindow):
         queue_layout.addWidget(self.queue_status)
         layout.addWidget(queue_card, 1)
         return page
+
+
+    def _build_music_page(self) -> QWidget:
+        page = DropTarget()
+        page.filesDropped.connect(self._handle_music_dropped_files)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(2, 9, 2, 2)
+        layout.setSpacing(10)
+        intro = QHBoxLayout()
+        intro_text = QVBoxLayout()
+        heading = QLabel("Música y audio")
+        heading.setObjectName("pageTitle")
+        intro_text.addWidget(heading)
+        description = QLabel("Convierte tus archivos de audio a formatos de alta calidad. Los archivos originales no se modifican.")
+        description.setObjectName("mutedLabel")
+        intro_text.addWidget(description)
+        intro.addLayout(intro_text)
+        intro.addStretch(1)
+        self.music_count = QLabel("0 archivos")
+        self.music_count.setObjectName("countPill")
+        intro.addWidget(self.music_count)
+        layout.addLayout(intro)
+        card = QFrame()
+        card.setObjectName("surfaceCard")
+        body = QVBoxLayout(card)
+        body.setContentsMargins(15, 13, 15, 13)
+        body.setSpacing(9)
+        title = QLabel("Biblioteca de trabajo")
+        title.setObjectName("cardTitle")
+        body.addWidget(title)
+        self.music_list = QListWidget()
+        self.music_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.music_list.setMinimumHeight(260)
+        self.music_list.setAlternatingRowColors(True)
+        body.addWidget(self.music_list, 1)
+        file_actions = QHBoxLayout()
+        add_files = QPushButton("＋ Agregar archivos")
+        add_files.clicked.connect(self._choose_music_files)
+        file_actions.addWidget(add_files)
+        remove_files = QPushButton("Quitar seleccionados")
+        remove_files.clicked.connect(self._remove_music_files)
+        file_actions.addWidget(remove_files)
+        clear_files = QPushButton("Limpiar lista")
+        clear_files.clicked.connect(self._clear_music_files)
+        file_actions.addWidget(clear_files)
+        file_actions.addStretch(1)
+        body.addLayout(file_actions)
+        settings = QGridLayout()
+        settings.addWidget(self._small_label("FORMATO DE SALIDA"), 0, 0)
+        self.music_format = QComboBox()
+        self.music_format.addItems(AUDIO_OUTPUT_FORMATS)
+        self.music_format.setCurrentText("MP3")
+        settings.addWidget(self.music_format, 1, 0)
+        settings.addWidget(self._small_label("CALIDAD / BITRATE"), 0, 1)
+        self.music_bitrate = QComboBox()
+        self.music_bitrate.addItems(["96 kbps", "128 kbps", "192 kbps", "256 kbps", "320 kbps"])
+        self.music_bitrate.setCurrentText("320 kbps")
+        settings.addWidget(self.music_bitrate, 1, 1)
+        settings.addWidget(self._small_label("CARPETA DE DESTINO"), 0, 2)
+        destination_row = QHBoxLayout()
+        self.music_destination = QLineEdit(str(MUSIC_OUTPUT_DIR))
+        self.music_destination.setReadOnly(True)
+        destination_row.addWidget(self.music_destination, 1)
+        choose_destination = QPushButton("Cambiar")
+        choose_destination.clicked.connect(self._choose_music_destination)
+        destination_row.addWidget(choose_destination)
+        settings.addLayout(destination_row, 1, 2)
+        settings.setColumnStretch(2, 2)
+        body.addLayout(settings)
+        actions = QHBoxLayout()
+        self.music_convert_button = QPushButton("♫  CONVERTIR AUDIO")
+        self.music_convert_button.setObjectName("primaryButton")
+        self.music_convert_button.clicked.connect(self._start_music_conversion)
+        actions.addWidget(self.music_convert_button)
+        self.music_open_button = QPushButton("Abrir carpeta")
+        self.music_open_button.clicked.connect(lambda: self._open_folder(Path(self.music_destination.text())))
+        actions.addWidget(self.music_open_button)
+        actions.addStretch(1)
+        body.addLayout(actions)
+        self.music_progress = QProgressBar()
+        self.music_progress.setValue(0)
+        body.addWidget(self.music_progress)
+        self.music_status = QLabel("Agrega archivos de audio o arrástralos a esta ventana.")
+        self.music_status.setObjectName("mutedLabel")
+        self.music_status.setWordWrap(True)
+        body.addWidget(self.music_status)
+        layout.addWidget(card, 1)
+        return page
+
+    def _choose_music_files(self) -> None:
+        names, _ = QFileDialog.getOpenFileNames(
+            self, "Seleccionar archivos de audio", str(Path.home()),
+            "Archivos de audio (*.mp3 *.flac *.wav *.m4a *.aac *.ogg *.opus *.wma *.aiff *.alac);;Todos los archivos (*.*)"
+        )
+        self._add_music_paths([Path(name) for name in names])
+
+    def _handle_music_dropped_files(self, raw_paths: list[str]) -> None:
+        self._add_music_paths([Path(raw) for raw in raw_paths])
+
+    def _add_music_paths(self, paths: list[Path]) -> None:
+        added = 0
+        known = {str(path.resolve()).casefold() for path in self.music_files}
+        for path in paths:
+            candidates = []
+            if path.is_dir():
+                try:
+                    candidates = [item for item in path.rglob("*") if item.is_file() and item.suffix.lower() in AUDIO_EXTENSIONS]
+                except OSError:
+                    candidates = []
+            elif path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
+                candidates = [path]
+            for candidate in candidates:
+                try:
+                    key = str(candidate.resolve()).casefold()
+                    if key in known:
+                        continue
+                    self.music_files.append(candidate)
+                    self.music_list.addItem(f"{candidate.name}    ·    {human_file_size(candidate.stat().st_size)}")
+                    self.music_list.item(self.music_list.count() - 1).setToolTip(str(candidate))
+                    known.add(key)
+                    added += 1
+                except OSError:
+                    continue
+        self.music_count.setText(f"{len(self.music_files)} archivos")
+        if added:
+            self.music_status.setText(f"Se agregaron {added} archivo(s) de audio.")
+
+    def _remove_music_files(self) -> None:
+        for index in sorted({item.row() for item in self.music_list.selectedIndexes()}, reverse=True):
+            self.music_list.takeItem(index)
+            if 0 <= index < len(self.music_files):
+                self.music_files.pop(index)
+        self.music_count.setText(f"{len(self.music_files)} archivos")
+
+    def _clear_music_files(self) -> None:
+        if self.music_worker is not None and self.music_worker.isRunning():
+            return
+        self.music_files.clear()
+        self.music_list.clear()
+        self.music_count.setText("0 archivos")
+        self.music_progress.setValue(0)
+        self.music_status.setText("Lista vacía.")
+
+    def _choose_music_destination(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Carpeta de salida para música", self.music_destination.text())
+        if folder:
+            self.music_destination.setText(folder)
+
+    def _start_music_conversion(self) -> None:
+        if self.music_worker is not None and self.music_worker.isRunning():
+            return
+        if not self.music_files:
+            QMessageBox.information(self, "No hay archivos", "Agrega archivos de audio antes de convertir.")
+            return
+        if not find_ffmpeg():
+            QMessageBox.warning(self, "FFmpeg no detectado", "Instala FFmpeg y vuelve a abrir MediaFlow.")
+            return
+        bitrate = int(self.music_bitrate.currentText().split()[0])
+        output_format = self.music_format.currentText().lower()
+        jobs = [(source, output_format, "Original", "Alta", False) for source in self.music_files]
+        self.music_convert_button.setEnabled(False)
+        self.music_format.setEnabled(False)
+        self.music_bitrate.setEnabled(False)
+        self.music_progress.setValue(0)
+        self.music_worker = ConvertWorker(jobs, Path(self.music_destination.text()), audio_bitrate_kbps=bitrate)
+        self.music_worker.progress.connect(self._music_progress)
+        self.music_worker.succeeded.connect(self._music_succeeded)
+        self.music_worker.failed.connect(self._music_failed)
+        self.music_worker.cancelled.connect(self._music_cancelled)
+        self.music_worker.finished.connect(self._music_conversion_finished)
+        self.music_status.setText(f"Convirtiendo {len(jobs)} archivo(s) a {output_format.upper()} · {bitrate} kbps.")
+        self.music_worker.start()
+
+    def _music_progress(self, percent: int, message: str) -> None:
+        self.music_progress.setValue(percent)
+        self.music_status.setText(message)
+
+    def _music_succeeded(self, results: str) -> None:
+        count = len([line for line in results.splitlines() if line.strip()])
+        if count:
+            self.music_status.setText(f"Conversión terminada: {count} archivo(s). Destino: {self.music_destination.text()}")
+
+    def _music_failed(self, message: str) -> None:
+        self.music_status.setText("Algunos archivos no pudieron convertirse: " + message[:1200])
+
+    def _music_cancelled(self, message: str) -> None:
+        self.music_status.setText(message)
+
+    def _music_conversion_finished(self) -> None:
+        worker = self.music_worker
+        self.music_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.music_convert_button.setEnabled(True)
+        self.music_format.setEnabled(True)
+        self.music_bitrate.setEnabled(True)
 
     def _build_convert_page(self) -> QWidget:
         page = DropTarget()
@@ -3103,7 +3331,8 @@ class MediaFlowWindow(QMainWindow):
         converting = self.conversion_worker and self.conversion_worker.isRunning()
         scanning = self.folder_scan_worker and self.folder_scan_worker.isRunning()
         thumbnailing = self.thumbnail_worker and self.thumbnail_worker.isRunning()
-        if active or previewing or converting or scanning or thumbnailing:
+        musicing = self.music_worker and self.music_worker.isRunning()
+        if active or previewing or converting or musicing or scanning or thumbnailing:
             answer = QMessageBox.question(
                 self,
                 "Procesos activos",
@@ -3123,6 +3352,9 @@ class MediaFlowWindow(QMainWindow):
             if converting and self.conversion_worker is not None:
                 self.conversion_worker.requestInterruption()
                 self.conversion_worker.wait(8000)
+            if musicing and self.music_worker is not None:
+                self.music_worker.requestInterruption()
+                self.music_worker.wait(8000)
             if thumbnailing and self.thumbnail_worker is not None:
                 self.thumbnail_worker.requestInterruption()
                 self.thumbnail_worker.wait(25000)
