@@ -1598,6 +1598,7 @@ class MediaFlowWindow(QMainWindow):
         self.active_worker: DownloadWorker | None = None
         self.preview_worker: DownloadPreviewWorker | None = None
         self.preview_queue: list[str] = []
+        self.download_queue_started = False
         self.conversion_worker: ConvertWorker | None = None
         self.music_worker: ConvertWorker | None = None
         self.music_download_worker: MusicUrlDownloadWorker | None = None
@@ -2163,7 +2164,7 @@ class MediaFlowWindow(QMainWindow):
 
         download_action_row = QHBoxLayout()
         download_action_row.addStretch(1)
-        self.download_add_button = QPushButton("↓  DESCARGAR")
+        self.download_add_button = QPushButton("⌕  PROCESAR VIDEO")
         self.download_add_button.setObjectName("primaryButton")
         self.download_add_button.setMinimumHeight(40)
         self.download_add_button.setMinimumWidth(190)
@@ -2238,9 +2239,9 @@ class MediaFlowWindow(QMainWindow):
         queue_layout.addWidget(self.queue_table, 1)
 
         controls_row = QHBoxLayout()
-        self.start_queue_button = QPushButton("▶  Iniciar cola")
+        self.start_queue_button = QPushButton("↓  Iniciar descarga")
         self.start_queue_button.setObjectName("primaryButton")
-        self.start_queue_button.clicked.connect(self._start_next_download)
+        self.start_queue_button.clicked.connect(self._start_download_queue)
         controls_row.addWidget(self.start_queue_button)
         self.cancel_download_button = QPushButton("✕  Cancelar seleccionadas")
         self.cancel_download_button.setObjectName("dangerButton")
@@ -2829,8 +2830,9 @@ class MediaFlowWindow(QMainWindow):
             "output_format": output_format,
             "auto_convert": auto_convert,
             "rate_kbps": self.speed_limit.value(),
-            "status": "Pendiente",
+            "status": "Procesando información",
             "path": "",
+            "duration": None,
         }
         self.tasks[task_id] = task
         row = self.queue_table.rowCount()
@@ -2844,7 +2846,7 @@ class MediaFlowWindow(QMainWindow):
         title_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.queue_table.setItem(row, 0, title_item)
         download_cell = DownloadQueueCell(
-            f"{parsed.netloc} · preparando miniatura…",
+            f"{parsed.netloc} · analizando video…",
             "AUDIO" if quality == "Solo audio" else "VIDEO",
         )
         download_cell.set_subtitle(f"{quality}  ·  {output_format}  ·  Pendiente")
@@ -2891,7 +2893,7 @@ class MediaFlowWindow(QMainWindow):
         self.queue_table.setRowHeight(row, 72)
         self.task_rows[task_id] = row
         self.url_input.clear()
-        self.queue_status.setText(f"Se agregó una descarga. Estamos obteniendo su miniatura; formato final: {output_format}.")
+        self.queue_status.setText(f"Procesando información del video: título, miniatura y duración. Formato final: {output_format}.")
         self._refresh_summary()
         self.preview_queue.append(task_id)
         self._start_next_download_preview()
@@ -2997,13 +2999,22 @@ class MediaFlowWindow(QMainWindow):
         task["preview_thumbnail"] = image_bytes or b""
         item = self.queue_table.item(row, 0)
         task["title"] = title
+        duration = info.get("duration") if isinstance(info, dict) else None
+        try:
+            task["duration"] = float(duration) if duration is not None else None
+        except (TypeError, ValueError):
+            task["duration"] = None
         if item:
             item.setToolTip(task["url"] + ("\nMiniatura disponible" if image_bytes else "\nEl sitio no proporcionó miniatura."))
         cell = self.download_cells.get(task_id)
         if cell is not None:
             cell.set_title(title)
-            cell.set_subtitle(f"{task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  Miniatura {'lista' if image_bytes else 'no disponible'}")
+            duration_label = _format_clock(task.get("duration"))
+            cell.set_subtitle(f"{duration_label}  ·  {task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  Listo para descargar")
             cell.set_thumbnail_bytes(image_bytes)
+        self._set_task_status(task_id, "Pendiente")
+        self.queue_status.setText(f"Video procesado: {title}. Ya puedes agregar más enlaces o iniciar la descarga.")
+        self._refresh_summary()
 
     def _on_download_preview_failed(self, task_id: str, message: str) -> None:
         row = self.task_rows.get(task_id)
@@ -3016,7 +3027,9 @@ class MediaFlowWindow(QMainWindow):
         if cell is not None:
             task = self.tasks.get(task_id, {})
             cell.set_subtitle(f"{task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  Miniatura no disponible")
-        self.queue_status.setText("No se pudo obtener la miniatura de una descarga. Puedes intentar descargarla igualmente.")
+        self._set_task_status(task_id, "Error")
+        self.queue_status.setText("No se pudo procesar este enlace. Revisa el detalle del error en la fila e inténtalo de nuevo.")
+        self._refresh_summary()
 
     def _on_download_preview_finished(self) -> None:
         if self.preview_worker is not None:
@@ -3024,13 +3037,26 @@ class MediaFlowWindow(QMainWindow):
             self.preview_worker = None
         QTimer.singleShot(100, self._start_next_download_preview)
 
+    def _start_download_queue(self) -> None:
+        processing = any(task.get("status") == "Procesando información" for task in self.tasks.values())
+        if processing:
+            self.queue_status.setText("Espera a que termine el procesamiento de todos los enlaces antes de iniciar la descarga.")
+            return
+        if not any(task.get("status") == "Pendiente" for task in self.tasks.values()):
+            self.queue_status.setText("Primero procesa uno o varios videos para agregarlos a la cola.")
+            return
+        self.download_queue_started = True
+        self._start_next_download()
+
     def _start_next_download(self) -> None:
+        if not self.download_queue_started:
+            return
         if self.active_worker is not None and self.active_worker.isRunning():
             return
         pending = next((task for task in self.tasks.values() if task["status"] == "Pendiente"), None)
         if pending is None:
-            self.queue_status.setText("La cola terminó. Puedes agregar más enlaces cuando quieras.")
-            self.start_queue_button.setEnabled(False)
+            self.queue_status.setText("La cola terminó. Puedes procesar más enlaces cuando quieras.")
+            self.download_queue_started = False
             self._refresh_summary()
             return
         self.start_queue_button.setEnabled(True)
@@ -3061,7 +3087,8 @@ class MediaFlowWindow(QMainWindow):
         if cell is not None:
             cell.set_title(title)
             cell.set_thumbnail_bytes(image_bytes)
-            cell.set_subtitle(f"{self.tasks[task_id].get('quality', 'Mejor disponible')}  ·  {self.tasks[task_id].get('output_format', 'MPG')}  ·  Descargando")
+            duration_label = _format_clock(self.tasks[task_id].get("duration")) if self.tasks[task_id].get("duration") is not None else "Duración no disponible"
+            cell.set_subtitle(f"{duration_label}  ·  {self.tasks[task_id].get('quality', 'Mejor disponible')}  ·  {self.tasks[task_id].get('output_format', 'MPG')}  ·  Descargando")
 
     def _on_download_progress(self, task_id: str, percent: int, speed: str, eta: str, state: str) -> None:
         row = self.task_rows.get(task_id)
@@ -3089,7 +3116,8 @@ class MediaFlowWindow(QMainWindow):
         cell = self.download_cells.get(task_id)
         if cell is not None:
             task = self.tasks.get(task_id, {})
-            cell.set_subtitle(f"{task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  {status}")
+            duration_label = _format_clock(task.get("duration")) if task.get("duration") is not None else "Duración pendiente"
+            cell.set_subtitle(f"{duration_label}  ·  {task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  {status}")
         if row is not None:
             format_editor = self.download_format_editors.get(task_id)
             if format_editor is not None:
@@ -3135,7 +3163,8 @@ class MediaFlowWindow(QMainWindow):
             self.active_worker.deleteLater()
             self.active_worker = None
         self._refresh_summary()
-        QTimer.singleShot(200, self._start_next_download)
+        if self.download_queue_started:
+            QTimer.singleShot(200, self._start_next_download)
 
     def _cancel_selected_downloads(self) -> None:
         rows = sorted({index.row() for index in self.queue_table.selectionModel().selectedRows()})
@@ -3221,12 +3250,15 @@ class MediaFlowWindow(QMainWindow):
             return
         values = list(self.tasks.values())
         completed = sum(1 for task in values if task["status"] == "Completado")
-        active = sum(1 for task in values if task["status"] in ("Preparando", "Descargando", "Convirtiendo", "Cancelando…"))
+        active = sum(1 for task in values if task["status"] in ("Procesando información", "Preparando", "Descargando", "Convirtiendo", "Cancelando…"))
         self.total_value.setText(str(len(values)))
         self.done_value.setText(str(completed))
         self.active_value.setText(str(active))
         self.queue_summary.setText(f"{len(values)} elementos")
-        self.start_queue_button.setEnabled(any(task["status"] == "Pendiente" for task in values))
+        ready = any(task["status"] == "Pendiente" for task in values)
+        processing = any(task["status"] == "Procesando información" for task in values)
+        running = self.active_worker is not None and self.active_worker.isRunning()
+        self.start_queue_button.setEnabled(ready and not processing and not running)
 
     def _choose_source_files(self) -> None:
         filenames, _ = QFileDialog.getOpenFileNames(
