@@ -18,6 +18,7 @@ from PySide6.QtCore import Qt, QThread, QTimer, QUrl, QSize, Signal, QSignalBloc
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap, QColor, QPainter, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -1104,6 +1105,97 @@ class ThumbnailWorker(QThread):
                 continue
 
 
+
+
+class PlaylistSelectionDialog(QDialog):
+    """Let the user choose individual entries from a detected playlist."""
+
+    def __init__(self, entries: list[dict], selected_video_id: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Seleccionar videos de la lista")
+        self.setMinimumSize(680, 520)
+        self.entries = [entry for entry in entries if isinstance(entry, dict)]
+        layout = QVBoxLayout(self)
+        heading = QLabel("Se detectó una lista de reproducción")
+        heading.setObjectName("cardTitle")
+        layout.addWidget(heading)
+        note = QLabel("El video del enlace aparece marcado inicialmente. Marca los demás videos que quieras agregar a la cola.")
+        note.setObjectName("mutedLabel")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        actions = QHBoxLayout()
+        select_all = QPushButton("Seleccionar todos")
+        select_none = QPushButton("Desmarcar todos")
+        actions.addWidget(select_all)
+        actions.addWidget(select_none)
+        actions.addStretch(1)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("countPill")
+        actions.addWidget(self.count_label)
+        layout.addLayout(actions)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setIconSize(QSize(112, 63))
+        self.list_widget.setSpacing(3)
+        layout.addWidget(self.list_widget, 1)
+        first_checked = False
+        for entry in self.entries:
+            title = str(entry.get("title") or entry.get("id") or "Video sin título")
+            duration = _format_clock(entry.get("duration"))
+            item = QListWidgetItem(title + "   ·   " + duration)
+            item.setToolTip(str(entry.get("webpage_url") or entry.get("url") or title))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            entry_id = str(entry.get("id") or "")
+            is_current = bool(selected_video_id and entry_id == selected_video_id)
+            if is_current and not first_checked:
+                item.setCheckState(Qt.Checked)
+                first_checked = True
+            else:
+                item.setCheckState(Qt.Unchecked)
+            thumb = entry.get("_mediaflow_thumbnail")
+            if isinstance(thumb, bytes) and thumb:
+                pixmap = QPixmap()
+                if pixmap.loadFromData(thumb):
+                    item.setIcon(QIcon(_center_crop_pixmap(pixmap, QSize(112, 63))))
+            self.list_widget.addItem(item)
+        if self.entries and not first_checked:
+            self.list_widget.item(0).setCheckState(Qt.Checked)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancelar")
+        accept = QPushButton("Agregar seleccionados")
+        accept.setObjectName("primaryButton")
+        buttons.addWidget(cancel)
+        buttons.addWidget(accept)
+        layout.addLayout(buttons)
+        select_all.clicked.connect(lambda: self._set_all(Qt.Checked))
+        select_none.clicked.connect(lambda: self._set_all(Qt.Unchecked))
+        cancel.clicked.connect(self.reject)
+        accept.clicked.connect(self.accept)
+        self.list_widget.itemChanged.connect(self._update_count)
+        self._update_count()
+
+    def _set_all(self, state) -> None:
+        for index in range(self.list_widget.count()):
+            self.list_widget.item(index).setCheckState(state)
+
+    def _update_count(self, *_args) -> None:
+        selected = sum(
+            self.list_widget.item(index).checkState() == Qt.Checked
+            for index in range(self.list_widget.count())
+        )
+        self.count_label.setText(f"{selected} seleccionados")
+
+    def selected_entries(self) -> list[dict]:
+        return [
+            self.entries[index]
+            for index in range(min(len(self.entries), self.list_widget.count()))
+            if self.list_widget.item(index).checkState() == Qt.Checked
+        ]
+
+
 class DownloadPreviewWorker(QThread):
     """Fetch title, metadata and a thumbnail before a queued download starts."""
     ready = Signal(str, str, bytes, object)
@@ -1148,7 +1240,7 @@ class DownloadPreviewWorker(QThread):
             options = {
                 "quiet": True,
                 "no_warnings": True,
-                "noplaylist": True,
+                "noplaylist": False,
                 "skip_download": True,
                 "socket_timeout": 20,
                 "retries": 1,
@@ -1159,8 +1251,16 @@ class DownloadPreviewWorker(QThread):
                 return
             if not isinstance(info, dict):
                 raise RuntimeError("El sitio no devolvió información válida del contenido.")
-            title = str(info.get("title") or self.url)
-            thumb_data = self._thumbnail_bytes(info)
+            if info.get("_type") == "playlist":
+                entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+                # Fetch a bounded set of preview images off the UI thread; entries remain selectable even without artwork.
+                for entry in entries[:60]:
+                    entry["_mediaflow_thumbnail"] = self._thumbnail_bytes(entry)
+                title = str(info.get("title") or "Lista de reproducción")
+                thumb_data = b""
+            else:
+                title = str(info.get("title") or self.url)
+                thumb_data = self._thumbnail_bytes(info)
             self.ready.emit(self.task_id, title, thumb_data, info)
         except Exception as exc:
             if not self.isInterruptionRequested():
@@ -2339,6 +2439,42 @@ class MediaFlowWindow(QMainWindow):
         task = self.tasks.get(task_id)
         row = self.task_rows.get(task_id)
         if task is None or row is None:
+            return
+        if isinstance(info, dict) and info.get("_type") == "playlist":
+            entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+            selected_id = str((info.get("requested_entries") or [{}])[0].get("id") or "")
+            dialog = PlaylistSelectionDialog(entries, selected_id, self)
+            dialog.setWindowTitle(f"MediaFlow · {title}")
+            chosen = dialog.exec()
+            # Replace the temporary parent row with one queue item per selected video.
+            self.queue_table.removeRow(row)
+            self.tasks.pop(task_id, None)
+            self.task_rows.pop(task_id, None)
+            self.download_cells.pop(task_id, None)
+            self.download_format_editors.pop(task_id, None)
+            self.download_progress_bars.pop(task_id, None)
+            self._reindex_rows()
+            if chosen == QDialog.Accepted:
+                selected_entries = dialog.selected_entries()
+                added = 0
+                for entry in selected_entries:
+                    video_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+                    if not video_url.startswith(("http://", "https://")):
+                        entry_id = str(entry.get("id") or "").strip()
+                        if entry_id and str(entry.get("ie_key") or "").lower() in ("youtube", "youtubeplaylist"):
+                            video_url = f"https://www.youtube.com/watch?v={entry_id}"
+                    if not video_url:
+                        continue
+                    self.url_input.setText(video_url)
+                    self._add_download()
+                    added += 1
+                self.queue_status.setText(
+                    f"Se agregaron {added} videos seleccionados de «{title}» a la cola."
+                    if added else "No se agregaron videos: no se encontraron enlaces individuales válidos."
+                )
+            else:
+                self.queue_status.setText("Selección de lista cancelada; no se agregó ningún video.")
+            self._refresh_summary()
             return
         if isinstance(info, dict):
             task["preview_info"] = info
