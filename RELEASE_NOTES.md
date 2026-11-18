@@ -1,3 +1,11 @@
+## MediaFlow 0.5.1
+
+- La sección Música permite pegar enlaces de YouTube, descargar la mejor pista de audio disponible y elegir formato de salida y bitrate.
+- La sección Convertir ya no muestra miniaturas y presenta una barra de progreso independiente para cada archivo.
+- Se conserva la vista previa de título y miniatura en la cola de Descargas antes de iniciar la descarga.
+- Se mantienen los formatos de audio, los metadatos compatibles, la selección de videos de listas y el actualizador.
+- No incluye integraciones ni funciones relacionadas con Spotify.
+
 ## MediaFlow 0.5.0
 
 - Detección de listas de reproducción y selección individual de videos antes de agregarlos a la cola.

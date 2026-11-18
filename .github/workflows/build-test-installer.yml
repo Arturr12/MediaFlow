@@ -29,7 +29,7 @@ jobs:
       - name: Validar versión
         shell: pwsh
         run: |
-          $version = "0.5.0"
+          $version = "0.5.1"
           if ($version -notmatch '^\d+\.\d+\.\d+$') {
             throw "Versión no válida: $version. Usa el formato X.Y.Z."
           }
@@ -46,14 +46,14 @@ jobs:
 
       - name: Compilar EXE, instalador y manifiesto
         shell: pwsh
-        run: python tools/build_release.py --version "0.5.0"
+        run: python tools/build_release.py --version "0.5.1"
 
       - name: Publicar instalador como artefacto de prueba
         uses: actions/upload-artifact@v4
         with:
-          name: MediaFlow-Test-0.5.0
+          name: MediaFlow-Test-0.5.1
           path: |
-            Output/MediaFlow-Setup-0.5.0.exe
+            Output/MediaFlow-Setup-0.5.1.exe
             Output/mediaflow-update.json
           if-no-files-found: error
           retention-days: 14
