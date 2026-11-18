@@ -1,3 +1,10 @@
+## MediaFlow 0.5.2
+
+- Corrige la creación de archivos de audio con títulos de YouTube que contienen caracteres no válidos para Windows.
+- La vista previa de Descargas mejora la extracción de título y la recuperación de miniaturas, incluyendo una segunda ruta de descarga de imagen.
+- Las descargas de video reutilizan la miniatura obtenida en el análisis y muestran errores de análisis más claros.
+- Se conservan las funciones y formatos incorporados en 0.5.1.
+
 ## MediaFlow 0.5.1
 
 - La sección Música permite pegar enlaces de YouTube, descargar la mejor pista de audio disponible y elegir formato de salida y bitrate.

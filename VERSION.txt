@@ -1,2 +1,2 @@
-MediaFlow 0.5.1
+MediaFlow 0.5.2
 Actualizaciones mediante GitHub Releases con consentimiento del usuario y verificacion SHA-256.

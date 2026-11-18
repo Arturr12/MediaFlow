@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import hashlib
 import shutil
 import subprocess
@@ -51,7 +52,7 @@ from updater import UpdateCheckWorker, UpdateDownloadWorker
 from update_core import validate_repository_name
 
 APP_NAME = "MediaFlow"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
 DEFAULT_UPDATE_REPOSITORY = "Arturr12/MediaFlow"
 BASE_OUTPUT = Path.home() / "Videos" / APP_NAME
 DEFAULT_DOWNLOADS = BASE_OUTPUT / "Descargados"
@@ -169,13 +170,29 @@ def find_deno() -> str | None:
     return None
 
 
+def safe_output_stem(stem: str, max_length: int = 110) -> str:
+    """Return a Windows-safe filename stem for titles supplied by remote sites."""
+    value = str(stem or "").strip()
+    value = "".join("_" if ord(char) < 32 or char in '<>:"/\\\\|?*' else char for char in value)
+    value = re.sub(r"\\s+", " ", value).strip(" .")
+    value = value[:max_length].rstrip(" .")
+    if not value:
+        value = "MediaFlow"
+    # Windows reserves these names even when an extension is appended.
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+    if value.split(".", 1)[0].upper() in reserved:
+        value = f"_{value}"
+    return value
+
+
 def unique_output_path(folder: Path, stem: str, extension: str) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
-    safe_stem = stem[:150].strip(" .") or "video"
-    candidate = folder / f"{safe_stem}_MediaFlow.{extension.lower()}"
+    safe_stem = safe_output_stem(stem)
+    safe_extension = re.sub(r"[^a-zA-Z0-9]", "", str(extension or "mp4")).lower() or "mp4"
+    candidate = folder / f"{safe_stem}_MediaFlow.{safe_extension}"
     counter = 2
     while candidate.exists():
-        candidate = folder / f"{safe_stem}_MediaFlow_{counter}.{extension.lower()}"
+        candidate = folder / f"{safe_stem}_MediaFlow_{counter}.{safe_extension}"
         counter += 1
     return candidate
 
@@ -680,7 +697,10 @@ def convert_media(
             stderr_file.flush()
             stderr_file.seek(max(0, stderr_file.tell() - 12000))
             details = stderr_file.read().decode("utf-8", errors="replace").strip()
-            raise RuntimeError(details[-5000:] or f"FFmpeg terminó con código {return_code}.")
+            raise RuntimeError(
+                (details[-5000:] + f"\\nArchivo de origen: {source}\\nArchivo de salida: {command[-1]}")
+                if details else f"FFmpeg terminó con código {return_code}.\\nOrigen: {source}\\nSalida: {command[-1]}"
+            )
 
     try:
         if use_fat32_target:
@@ -918,7 +938,10 @@ class DownloadWorker(QThread):
                 title = str(info.get("title") or self.task["url"])
                 self.task["media_id"] = str(info.get("id") or "")
                 if title:
-                    self.metadata.emit(task_id, title, b"")
+                    thumbnail_bytes = self.task.get("preview_thumbnail", b"")
+                    if not thumbnail_bytes:
+                        thumbnail_bytes = DownloadPreviewWorker._thumbnail_bytes(info, ydl)
+                    self.metadata.emit(task_id, title, thumbnail_bytes or b"")
                 if self.isInterruptionRequested():
                     raise OperationCancelled("Descarga cancelada por el usuario.")
                 result_info = ydl.process_ie_result(info, download=True)
@@ -1224,7 +1247,7 @@ class AudioCoverWorker(QThread):
 
 
 class DownloadPreviewWorker(QThread):
-    """Fetch title, metadata and a thumbnail before a queued download starts."""
+    """Fetch video title and thumbnail before a queued download starts."""
     ready = Signal(str, str, bytes, object)
     failed = Signal(str, str)
 
@@ -1234,25 +1257,41 @@ class DownloadPreviewWorker(QThread):
         self.url = url
 
     @staticmethod
-    def _thumbnail_bytes(info: dict) -> bytes:
-        thumb_url = info.get("thumbnail")
-        if not thumb_url:
-            for thumbnail_info in reversed(info.get("thumbnails") or []):
-                if isinstance(thumbnail_info, dict) and thumbnail_info.get("url"):
-                    thumb_url = thumbnail_info["url"]
-                    break
-        if not thumb_url:
-            return b""
-        try:
-            request = urllib.request.Request(
-                thumb_url,
-                headers={"User-Agent": "Mozilla/5.0 MediaFlow/0.4.3"},
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = response.read(4 * 1024 * 1024)
-            return data if data else b""
-        except Exception:
-            return b""
+    def _thumbnail_bytes(info: dict, ydl=None) -> bytes:
+        candidates: list[str] = []
+        primary = info.get("thumbnail")
+        if isinstance(primary, str) and primary:
+            candidates.append(primary)
+        thumbnails = [
+            item for item in (info.get("thumbnails") or [])
+            if isinstance(item, dict) and isinstance(item.get("url"), str) and item["url"]
+        ]
+        thumbnails.sort(
+            key=lambda item: (
+                int(item.get("preference") or 0),
+                int(item.get("width") or 0) * int(item.get("height") or 0),
+            ),
+            reverse=True,
+        )
+        candidates.extend(item["url"] for item in thumbnails)
+        seen: set[str] = set()
+        for thumb_url in candidates:
+            if thumb_url in seen:
+                continue
+            seen.add(thumb_url)
+            try:
+                request = urllib.request.Request(
+                    thumb_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"},
+                )
+                opener = ydl.urlopen if ydl is not None else urllib.request.urlopen
+                with opener(request, timeout=15) as response:
+                    data = response.read(4 * 1024 * 1024 + 1)
+                if data and len(data) <= 4 * 1024 * 1024:
+                    return data
+            except Exception:
+                continue
+        return b""
 
     def run(self) -> None:
         try:
@@ -1269,29 +1308,53 @@ class DownloadPreviewWorker(QThread):
                 "no_warnings": True,
                 "noplaylist": False,
                 "skip_download": True,
-                "socket_timeout": 20,
-                "retries": 1,
+                "cachedir": False,
+                "socket_timeout": 25,
+                "retries": 2,
+                "extractor_retries": 3,
+                "file_access_retries": 2,
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+                    "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
+                },
             }
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(self.url, download=False)
+                if self.isInterruptionRequested():
+                    return
+                if not isinstance(info, dict):
+                    raise RuntimeError("YouTube no devolvió información del video. Comprueba que el enlace sea público y válido.")
+                if info.get("_type") == "playlist":
+                    entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+                    # Hydrate entries that yt-dlp returned as flat playlist items.
+                    hydrated: list[dict] = []
+                    for entry in entries[:60]:
+                        if self.isInterruptionRequested():
+                            return
+                        current = entry
+                        if not current.get("title") or not current.get("thumbnail"):
+                            entry_url = current.get("webpage_url") or current.get("url")
+                            if entry_url and str(entry_url).startswith(("http://", "https://")):
+                                try:
+                                    detailed = ydl.extract_info(str(entry_url), download=False)
+                                    if isinstance(detailed, dict):
+                                        current = {**current, **detailed}
+                                except Exception:
+                                    pass
+                        current["_mediaflow_thumbnail"] = self._thumbnail_bytes(current, ydl)
+                        hydrated.append(current)
+                    info["entries"] = hydrated + entries[len(hydrated):]
+                    title = str(info.get("title") or "Lista de reproducción")
+                    thumb_data = b""
+                else:
+                    title = str(info.get("title") or info.get("id") or self.url)
+                    thumb_data = self._thumbnail_bytes(info, ydl)
             if self.isInterruptionRequested():
                 return
-            if not isinstance(info, dict):
-                raise RuntimeError("El sitio no devolvió información válida del contenido.")
-            if info.get("_type") == "playlist":
-                entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
-                # Fetch a bounded set of preview images off the UI thread; entries remain selectable even without artwork.
-                for entry in entries[:60]:
-                    entry["_mediaflow_thumbnail"] = self._thumbnail_bytes(entry)
-                title = str(info.get("title") or "Lista de reproducción")
-                thumb_data = b""
-            else:
-                title = str(info.get("title") or self.url)
-                thumb_data = self._thumbnail_bytes(info)
             self.ready.emit(self.task_id, title, thumb_data, info)
         except Exception as exc:
             if not self.isInterruptionRequested():
-                self.failed.emit(self.task_id, str(exc))
+                self.failed.emit(self.task_id, f"No se pudo analizar el enlace de YouTube: {exc}")
 
 
 class MusicUrlDownloadWorker(QThread):
@@ -1317,7 +1380,7 @@ class MusicUrlDownloadWorker(QThread):
             self.progress.emit(78, "Audio recibido; preparando conversión…")
 
     def run(self) -> None:
-        temp_dir = self.output_dir / ".mediaflow_audio_temp"
+        temp_dir = Path(tempfile.mkdtemp(prefix="mediaflow-audio-"))
         source = None
         try:
             deno = find_deno()
@@ -1379,6 +1442,11 @@ class MusicUrlDownloadWorker(QThread):
                 self.cancelled.emit("Descarga de música cancelada.")
             else:
                 self.failed.emit(str(exc))
+        finally:
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except OSError:
+                pass
 
 
 class ConvertWorker(QThread):
@@ -2922,6 +2990,7 @@ class MediaFlowWindow(QMainWindow):
             return
         if isinstance(info, dict):
             task["preview_info"] = info
+        task["preview_thumbnail"] = image_bytes or b""
         item = self.queue_table.item(row, 0)
         task["title"] = title
         if item:

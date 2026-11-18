@@ -1,6 +1,6 @@
 #define MyAppName "MediaFlow"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.5.1"
+  #define MyAppVersion "0.5.2"
 #endif
 #define MyAppPublisher "MediaFlow"
 #define MyAppExeName "MediaFlow.exe"
@@ -56,7 +56,7 @@ begin
   Result := True;
   if not IsWin64 then
   begin
-    MsgBox('MediaFlow 0.5.1 requiere Windows de 64 bits.', mbError, MB_OK);
+    MsgBox('MediaFlow 0.5.2 requiere Windows de 64 bits.', mbError, MB_OK);
     Result := False;
   end;
 end;
