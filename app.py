@@ -1217,6 +1217,50 @@ class PlaylistSelectionDialog(QDialog):
         ]
 
 
+
+
+class AudioCoverWorker(QThread):
+    """Extract embedded album artwork without blocking the music workspace."""
+    coverReady = Signal(str, bytes)
+
+    def __init__(self, sources: list[Path]):
+        super().__init__()
+        self.sources = list(sources)
+
+    def run(self) -> None:
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            return
+        cache_dir = _thumbnail_cache_directory()
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        for source in self.sources:
+            if self.isInterruptionRequested():
+                break
+            try:
+                stat = source.stat()
+                identity = f"audio-cover|{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+                digest = hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()[:24]
+                cover = cache_dir / f"{digest}.jpg"
+                if not cover.is_file():
+                    result = subprocess.run(
+                        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+                         "-map", "0:v:0", "-frames:v", "1", "-q:v", "3", str(cover)],
+                        capture_output=True, timeout=20,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    if result.returncode != 0 or not cover.is_file() or cover.stat().st_size == 0:
+                        cover.unlink(missing_ok=True)
+                        continue
+                data = cover.read_bytes()
+                if data:
+                    self.coverReady.emit(str(source), data)
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+
 class DownloadPreviewWorker(QThread):
     """Fetch title, metadata and a thumbnail before a queued download starts."""
     ready = Signal(str, str, bytes, object)
@@ -1433,6 +1477,9 @@ class MediaFlowWindow(QMainWindow):
         self.conversion_worker: ConvertWorker | None = None
         self.music_worker: ConvertWorker | None = None
         self.music_files: list[Path] = []
+        self.music_items_by_path: dict[str, QListWidgetItem] = {}
+        self.music_cover_worker: AudioCoverWorker | None = None
+        self.music_cover_pending: list[Path] = []
         self.folder_scan_worker: FolderScanWorker | None = None
         self.thumbnail_worker: ThumbnailWorker | None = None
         self.thumbnail_pending: list[Path] = []
@@ -2123,6 +2170,7 @@ class MediaFlowWindow(QMainWindow):
         self.music_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.music_list.setMinimumHeight(260)
         self.music_list.setAlternatingRowColors(True)
+        self.music_list.setIconSize(QSize(56, 56))
         body.addWidget(self.music_list, 1)
         file_actions = QHBoxLayout()
         add_files = QPushButton("＋ Agregar archivos")
@@ -2190,6 +2238,7 @@ class MediaFlowWindow(QMainWindow):
 
     def _add_music_paths(self, paths: list[Path]) -> None:
         added = 0
+        newly_added: list[Path] = []
         known = {str(path.resolve()).casefold() for path in self.music_files}
         for path in paths:
             candidates = []
@@ -2206,21 +2255,28 @@ class MediaFlowWindow(QMainWindow):
                     if key in known:
                         continue
                     self.music_files.append(candidate)
-                    self.music_list.addItem(f"{candidate.name}    ·    {human_file_size(candidate.stat().st_size)}")
-                    self.music_list.item(self.music_list.count() - 1).setToolTip(str(candidate))
+                    item = QListWidgetItem(f"{candidate.name}    ·    {human_file_size(candidate.stat().st_size)}")
+                    item.setToolTip(str(candidate))
+                    item.setIcon(QIcon(_placeholder_pixmap(QSize(56, 56), "♫")))
+                    self.music_list.addItem(item)
+                    self.music_items_by_path[key] = item
+                    newly_added.append(candidate)
                     known.add(key)
                     added += 1
                 except OSError:
                     continue
         self.music_count.setText(f"{len(self.music_files)} archivos")
         if added:
-            self.music_status.setText(f"Se agregaron {added} archivo(s) de audio.")
+            self.music_status.setText(f"Se agregaron {added} archivo(s) de audio. Buscando portadas incrustadas…")
+            self.music_cover_pending.extend(newly_added)
+            self._start_music_cover_worker()
 
     def _remove_music_files(self) -> None:
         for index in sorted({item.row() for item in self.music_list.selectedIndexes()}, reverse=True):
-            self.music_list.takeItem(index)
+            item = self.music_list.takeItem(index)
             if 0 <= index < len(self.music_files):
-                self.music_files.pop(index)
+                path = self.music_files.pop(index)
+                self.music_items_by_path.pop(str(path.resolve()).casefold(), None)
         self.music_count.setText(f"{len(self.music_files)} archivos")
 
     def _clear_music_files(self) -> None:
@@ -2228,9 +2284,43 @@ class MediaFlowWindow(QMainWindow):
             return
         self.music_files.clear()
         self.music_list.clear()
+        self.music_items_by_path.clear()
+        self.music_cover_pending.clear()
         self.music_count.setText("0 archivos")
         self.music_progress.setValue(0)
         self.music_status.setText("Lista vacía.")
+
+
+    def _start_music_cover_worker(self) -> None:
+        if self.music_cover_worker is not None and self.music_cover_worker.isRunning():
+            return
+        if not self.music_cover_pending:
+            return
+        batch = self.music_cover_pending
+        self.music_cover_pending = []
+        worker = AudioCoverWorker(batch)
+        self.music_cover_worker = worker
+        worker.coverReady.connect(self._on_music_cover_ready)
+        worker.finished.connect(self._music_cover_worker_finished)
+        worker.start()
+
+    def _on_music_cover_ready(self, raw_path: str, image_bytes: bytes) -> None:
+        key = str(Path(raw_path).resolve()).casefold()
+        item = self.music_items_by_path.get(key)
+        if item is None:
+            return
+        pixmap = QPixmap()
+        if pixmap.loadFromData(image_bytes):
+            item.setIcon(QIcon(_center_crop_pixmap(pixmap, QSize(56, 56))))
+            item.setToolTip(raw_path + "\nPortada incrustada disponible")
+
+    def _music_cover_worker_finished(self) -> None:
+        worker = self.music_cover_worker
+        self.music_cover_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if self.music_cover_pending:
+            QTimer.singleShot(100, self._start_music_cover_worker)
 
     def _choose_music_destination(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Carpeta de salida para música", self.music_destination.text())
@@ -3335,7 +3425,8 @@ class MediaFlowWindow(QMainWindow):
         scanning = self.folder_scan_worker and self.folder_scan_worker.isRunning()
         thumbnailing = self.thumbnail_worker and self.thumbnail_worker.isRunning()
         musicing = self.music_worker and self.music_worker.isRunning()
-        if active or previewing or converting or musicing or scanning or thumbnailing:
+        covering = self.music_cover_worker and self.music_cover_worker.isRunning()
+        if active or previewing or converting or musicing or covering or scanning or thumbnailing:
             answer = QMessageBox.question(
                 self,
                 "Procesos activos",
@@ -3358,6 +3449,9 @@ class MediaFlowWindow(QMainWindow):
             if musicing and self.music_worker is not None:
                 self.music_worker.requestInterruption()
                 self.music_worker.wait(8000)
+            if covering and self.music_cover_worker is not None:
+                self.music_cover_worker.requestInterruption()
+                self.music_cover_worker.wait(8000)
             if thumbnailing and self.thumbnail_worker is not None:
                 self.thumbnail_worker.requestInterruption()
                 self.thumbnail_worker.wait(25000)
