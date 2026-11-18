@@ -2164,7 +2164,7 @@ class MediaFlowWindow(QMainWindow):
 
         download_action_row = QHBoxLayout()
         download_action_row.addStretch(1)
-        self.download_add_button = QPushButton("⌕  PROCESAR VIDEO")
+        self.download_add_button = QPushButton("⌕  Procesar video")
         self.download_add_button.setObjectName("primaryButton")
         self.download_add_button.setMinimumHeight(40)
         self.download_add_button.setMinimumWidth(190)
@@ -2804,9 +2804,6 @@ class MediaFlowWindow(QMainWindow):
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             QMessageBox.warning(self, "Enlace no válido", "Pega un enlace web completo que comience con http:// o https://.")
             return
-        if not find_ffmpeg():
-            QMessageBox.warning(self, "FFmpeg no detectado", "Instala FFmpeg y vuelve a abrir MediaFlow para descargar y convertir.")
-            return
         output_format = self.format_combo.currentText()
         auto_convert = self.auto_convert.isChecked()
         if not auto_convert and output_format in ("MPG", "AVI", "MP3"):
@@ -2886,7 +2883,7 @@ class MediaFlowWindow(QMainWindow):
         progress_host_layout.addWidget(progress, 1, Qt.AlignVCenter)
         self.queue_table.setCellWidget(row, 3, progress_host)
         self.download_progress_bars[task_id] = progress
-        for column, value in ((4, "—"), (5, "—"), (6, "Pendiente")):
+        for column, value in ((4, "—"), (5, "—"), (6, "Procesando")):
             cell_item = QTableWidgetItem(value)
             cell_item.setTextAlignment(Qt.AlignCenter)
             self.queue_table.setItem(row, column, cell_item)
@@ -3044,6 +3041,9 @@ class MediaFlowWindow(QMainWindow):
             return
         if not any(task.get("status") == "Pendiente" for task in self.tasks.values()):
             self.queue_status.setText("Primero procesa uno o varios videos para agregarlos a la cola.")
+            return
+        if not find_ffmpeg():
+            QMessageBox.warning(self, "FFmpeg no detectado", "Instala FFmpeg y vuelve a abrir MediaFlow para iniciar las descargas y conversiones.")
             return
         self.download_queue_started = True
         self._start_next_download()
