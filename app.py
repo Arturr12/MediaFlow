@@ -2208,7 +2208,7 @@ class MediaFlowWindow(QMainWindow):
         qtitle.setObjectName("cardTitle")
         qhead.addWidget(qtitle)
         qhead.addStretch(1)
-        queue_note = QLabel("Miniatura · título · formato · progreso")
+        queue_note = QLabel("Miniatura · título · duración · formato · progreso")
         queue_note.setObjectName("finePrint")
         qhead.addWidget(queue_note)
         queue_layout.addLayout(qhead)
@@ -2846,7 +2846,7 @@ class MediaFlowWindow(QMainWindow):
             f"{parsed.netloc} · analizando video…",
             "AUDIO" if quality == "Solo audio" else "VIDEO",
         )
-        download_cell.set_subtitle(f"{quality}  ·  {output_format}  ·  Pendiente")
+        download_cell.set_subtitle(f"{quality}  ·  {output_format}  ·  Procesando información…")
         self.queue_table.setCellWidget(row, 0, download_cell)
         self.download_cells[task_id] = download_cell
         quality_item = QTableWidgetItem(quality)
