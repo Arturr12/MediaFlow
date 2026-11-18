@@ -1,3 +1,11 @@
+## MediaFlow 0.5.3
+
+- Separa el procesamiento de enlaces de la descarga: Enter o «Procesar video» consulta la información y agrega el video a la cola sin descargarlo.
+- La vista previa de cada video muestra título, miniatura y duración antes de iniciar la descarga.
+- «Iniciar cola» ahora se llama «Iniciar descarga» y comienza la cola únicamente cuando el usuario lo solicita.
+- La cola espera a que todos los enlaces agregados terminen de procesarse antes de habilitar el inicio de descarga.
+- Se conserva la selección de videos de listas de reproducción y las funciones de Música y Convertir.
+
 ## MediaFlow 0.5.2
 
 - Corrige la creación de archivos de audio con títulos de YouTube que contienen caracteres no válidos para Windows.
