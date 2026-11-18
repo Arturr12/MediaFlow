@@ -52,7 +52,7 @@ from updater import UpdateCheckWorker, UpdateDownloadWorker
 from update_core import validate_repository_name
 
 APP_NAME = "MediaFlow"
-APP_VERSION = "0.5.2"
+APP_VERSION = "0.5.3"
 DEFAULT_UPDATE_REPOSITORY = "Arturr12/MediaFlow"
 BASE_OUTPUT = Path.home() / "Videos" / APP_NAME
 DEFAULT_DOWNLOADS = BASE_OUTPUT / "Descargados"
