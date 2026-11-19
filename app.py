@@ -541,6 +541,7 @@ def convert_media(
     quality: str = "Equilibrada",
     fat32_mode: bool = False,
     audio_bitrate_kbps: int | None = None,
+    cover_image_path: Path | None = None,
 ) -> None:
     """Convert with selectable resolution/quality and an optional FAT32-aware two-pass encode.
 
@@ -563,14 +564,20 @@ def convert_media(
     duration = _probe_duration(source)
     is_audio_output = fmt in {value.lower() for value in AUDIO_OUTPUT_FORMATS}
     use_fat32_target = bool(fat32_mode and not is_audio_output)
+    use_cover = bool(fmt == "mp3" and cover_image_path and cover_image_path.is_file())
 
     base = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(source)]
+    if use_cover:
+        base += ["-i", str(cover_image_path)]
     progress_args = ["-progress", "pipe:1", "-stats_period", "1", "-nostats"]
     audio_bitrate = int(quality_settings["audio_kbps"])
 
     selected_audio_bitrate = max(32, min(512, int(audio_bitrate_kbps or audio_bitrate)))
     if is_audio_output:
         video_args: list[str] = ["-map", "0:a:0", "-map_metadata", "0"]
+        if use_cover:
+            video_args += ["-map", "1:v:0", "-c:v", "copy", "-disposition:v:0", "attached_pic",
+                           "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
         # YouTube's bestaudio download normally has no attached-picture stream.
         # Do not map optional cover art here: FFmpeg builds vary in support for
         # the attached_pic metadata selector, and the map can abort conversion.
@@ -1400,6 +1407,8 @@ class MusicUrlDownloadWorker(QThread):
             options = {
                 "format": "bestaudio/best",
                 "outtmpl": str(temp_dir / "%(title).150B [%(id)s].%(ext)s"),
+                "writethumbnail": True,
+                "postprocessors": [{"key": "FFmpegThumbnailsConvertor", "format": "jpg"}],
                 "noplaylist": True, "windowsfilenames": True,
                 "quiet": True, "no_warnings": True,
                 "progress_hooks": [self._progress_hook],
@@ -1423,6 +1432,10 @@ class MusicUrlDownloadWorker(QThread):
                 if source is None:
                     raise RuntimeError("No localicé el audio descargado.")
                 title = str(info.get("title") or source.stem)
+                cover_candidates = [p for p in temp_dir.glob("*") if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg"}]
+                if vid:
+                    cover_candidates.sort(key=lambda p: (vid in p.name, p.stat().st_mtime), reverse=True)
+                cover_image = cover_candidates[0] if cover_candidates else None
             if self.isInterruptionRequested():
                 raise OperationCancelled("Descarga cancelada.")
             destination = unique_output_path(self.output_dir, title, self.output_format)
@@ -1432,7 +1445,8 @@ class MusicUrlDownloadWorker(QThread):
                 self.progress.emit(min(99, shown), f"Convirtiendo audio · {detail}")
             convert_media(source, destination, self.output_format, report,
                           cancel_check=self.isInterruptionRequested,
-                          audio_bitrate_kbps=self.bitrate)
+                          audio_bitrate_kbps=self.bitrate,
+                          cover_image_path=cover_image)
             try:
                 source.unlink()
             except OSError:
