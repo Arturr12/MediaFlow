@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import hashlib
 import shutil
 import subprocess
@@ -12,12 +13,13 @@ import urllib.request
 import uuid
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from PySide6.QtCore import Qt, QThread, QTimer, QUrl, QSize, Signal, QSignalBlocker, QSettings
 from PySide6.QtGui import QDesktopServices, QIcon, QPixmap, QColor, QPainter, QFontMetrics
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -50,7 +52,7 @@ from updater import UpdateCheckWorker, UpdateDownloadWorker
 from update_core import validate_repository_name
 
 APP_NAME = "MediaFlow"
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.5.3"
 DEFAULT_UPDATE_REPOSITORY = "Arturr12/MediaFlow"
 BASE_OUTPUT = Path.home() / "Videos" / APP_NAME
 DEFAULT_DOWNLOADS = BASE_OUTPUT / "Descargados"
@@ -61,6 +63,9 @@ SUPPORTED_EXTENSIONS = {
     ".aac", ".flac", ".ogg", ".opus",
 }
 OUTPUT_FORMATS = ["MP4", "MPG", "AVI", "MKV", "MP3"]
+AUDIO_OUTPUT_FORMATS = ["MP3", "FLAC", "WAV", "M4A", "AAC", "OGG", "OPUS"]
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".wma", ".aiff", ".alac"}
+MUSIC_OUTPUT_DIR = BASE_OUTPUT / "Musica"
 QUALITY_OPTIONS = ["Mejor disponible", "1080p", "720p", "480p", "360p", "Solo audio"]
 VIDEO_RESOLUTION_OPTIONS = ["Original", "1080p", "720p", "480p", "360p"]
 VIDEO_COMPRESSION_OPTIONS = ["Alta", "Equilibrada", "Compacta", "Muy compacta"]
@@ -165,13 +170,29 @@ def find_deno() -> str | None:
     return None
 
 
+def safe_output_stem(stem: str, max_length: int = 110) -> str:
+    """Return a Windows-safe filename stem for titles supplied by remote sites."""
+    value = str(stem or "").strip()
+    value = "".join("_" if ord(char) < 32 or char in '<>:"/\\\\|?*' else char for char in value)
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    value = value[:max_length].rstrip(" .")
+    if not value:
+        value = "MediaFlow"
+    # Windows reserves these names even when an extension is appended.
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+    if value.split(".", 1)[0].upper() in reserved:
+        value = f"_{value}"
+    return value
+
+
 def unique_output_path(folder: Path, stem: str, extension: str) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
-    safe_stem = stem[:150].strip(" .") or "video"
-    candidate = folder / f"{safe_stem}_MediaFlow.{extension.lower()}"
+    safe_stem = safe_output_stem(stem)
+    safe_extension = re.sub(r"[^a-zA-Z0-9]", "", str(extension or "mp4")).lower() or "mp4"
+    candidate = folder / f"{safe_stem}_MediaFlow.{safe_extension}"
     counter = 2
     while candidate.exists():
-        candidate = folder / f"{safe_stem}_MediaFlow_{counter}.{extension.lower()}"
+        candidate = folder / f"{safe_stem}_MediaFlow_{counter}.{safe_extension}"
         counter += 1
     return candidate
 
@@ -318,120 +339,75 @@ class ElidedLabel(QLabel):
 
 
 class ConversionRowWidget(QWidget):
-    """A clean, fixed-height conversion row with thumbnail and per-file format."""
+    """Compact conversion row with individual progress and no thumbnail."""
 
-    def __init__(
-        self,
-        list_widget: QListWidget,
-        item: QListWidgetItem,
-        source: Path,
-        output_format: str,
-    ):
+    def __init__(self, list_widget: QListWidget, item: QListWidgetItem, source: Path, output_format: str):
         super().__init__()
-        self.list_widget = list_widget
-        self.item = item
-        self.source = source
-        self.setFixedHeight(106)
+        self.list_widget, self.item, self.source = list_widget, item, source
+        self.setFixedHeight(82)
         self.setObjectName("conversionRow")
         self.setAttribute(Qt.WA_StyledBackground, True)
-
         root = QHBoxLayout(self)
-        root.setContentsMargins(10, 7, 10, 7)
+        root.setContentsMargins(12, 7, 12, 7)
         root.setSpacing(12)
-
-        self.thumbnail = QLabel()
-        self.thumbnail.setFixedSize(116, 66)
-        self.thumbnail.setAlignment(Qt.AlignCenter)
-        self.thumbnail.setPixmap(_placeholder_pixmap(
-            QSize(116, 66), "AUDIO" if source.suffix.lower() in ThumbnailWorker.AUDIO_ONLY_EXTENSIONS else "VIDEO"
-        ))
-        self.thumbnail.setStyleSheet("background:#172033; border:1px solid #303d55; border-radius:8px;")
-        self.thumbnail.setScaledContents(False)
-        root.addWidget(self.thumbnail, 0, Qt.AlignVCenter)
-
         details = QVBoxLayout()
         details.setContentsMargins(0, 0, 0, 0)
         details.setSpacing(3)
         self.title_label = ElidedLabel(source.name)
         self.title_label.setObjectName("conversionFileTitle")
-        self.title_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.title_label.setMinimumWidth(0)
-        self.title_label.setMinimumHeight(19)
-        self.title_label.setMaximumHeight(20)
-        self.title_label.setToolTip(str(source))
+        self.title_label.setMinimumHeight(18)
         details.addWidget(self.title_label)
-
         try:
-            size = source.stat().st_size
-            if size >= 1024 ** 3:
-                size_text = f"{size / (1024 ** 3):.2f} GB"
-            else:
-                size_text = f"{size / (1024 ** 2):.1f} MB"
+            size = human_file_size(source.stat().st_size)
         except OSError:
-            size_text = "Tamaño no disponible"
-        self.details_label = ElidedLabel(f"{size_text}  ·  {source.parent}")
+            size = "Tamaño no disponible"
+        self.details_label = ElidedLabel(f"{size}  ·  {source.parent}")
         self.details_label.setObjectName("conversionFileDetails")
-        self.details_label.setTextFormat(Qt.PlainText)
-        self.details_label.setWordWrap(False)
-        self.details_label.setMinimumWidth(0)
-        self.details_label.setMinimumHeight(17)
-        self.details_label.setMaximumHeight(18)
-        self.details_label.setToolTip(str(source.parent))
+        self.details_label.setMinimumHeight(16)
         details.addWidget(self.details_label)
-
-        self.status_label = ElidedLabel(
-            "Miniatura en preparación" if source.suffix.lower() not in ThumbnailWorker.AUDIO_ONLY_EXTENSIONS else "Archivo de audio"
-        )
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("En espera")
+        self.progress_bar.setFixedHeight(13)
+        details.addWidget(self.progress_bar)
+        self.status_label = ElidedLabel("Listo para convertir")
         self.status_label.setObjectName("conversionFileStatus")
-        self.status_label.setMinimumWidth(0)
-        self.status_label.setMinimumHeight(16)
-        self.status_label.setMaximumHeight(17)
+        self.status_label.setMinimumHeight(15)
         details.addWidget(self.status_label)
         root.addLayout(details, 1)
-
         separator = QFrame()
         separator.setFrameShape(QFrame.VLine)
         separator.setObjectName("rowSeparator")
         separator.setFixedWidth(1)
         root.addWidget(separator, 0, Qt.AlignVCenter)
-
-        format_box = QVBoxLayout()
-        format_box.setContentsMargins(2, 0, 2, 0)
-        format_box.setSpacing(4)
-        format_caption = QLabel("FORMATO DE SALIDA")
-        format_caption.setObjectName("fieldCaption")
-        format_box.addWidget(format_caption)
+        fmt = QVBoxLayout()
+        fmt.setContentsMargins(2, 0, 2, 0)
+        fmt.setSpacing(4)
+        caption = QLabel("FORMATO DE SALIDA")
+        caption.setObjectName("fieldCaption")
+        fmt.addWidget(caption)
         self.format_combo = QComboBox()
         self.format_combo.addItems(OUTPUT_FORMATS)
         self.format_combo.setCurrentText(output_format)
         self.format_combo.setMinimumWidth(104)
         self.format_combo.setMaximumWidth(118)
         self.format_combo.setFixedHeight(34)
-        self.format_combo.setToolTip("Puedes corregir el formato de este video aquí mismo, antes de iniciar la conversión.")
         self.format_combo.currentTextChanged.connect(self._format_changed)
-        format_box.addWidget(self.format_combo)
-        root.addLayout(format_box, 0)
+        fmt.addWidget(self.format_combo)
+        root.addLayout(fmt)
 
     def sizeHint(self) -> QSize:
-        return QSize(0, 106)
+        return QSize(0, 82)
 
     def _format_changed(self, value: str) -> None:
         self.item.setData(Qt.UserRole + 2, value)
-        self._select_item()
-
-    def _select_item(self) -> None:
         row = self.list_widget.row(self.item)
         if row >= 0:
             self.list_widget.setCurrentRow(row)
 
     def set_thumbnail(self, thumbnail_path: str) -> None:
-        pixmap = QPixmap(thumbnail_path)
-        if pixmap.isNull():
-            return
-        cropped = _center_crop_pixmap(pixmap, QSize(116, 66))
-        if not cropped.isNull():
-            self.thumbnail.setPixmap(cropped)
-            self.status_label.setText("Miniatura lista")
+        return
 
     def set_format(self, value: str) -> None:
         blocker = QSignalBlocker(self.format_combo)
@@ -444,6 +420,14 @@ class ConversionRowWidget(QWidget):
         if tooltip:
             self.status_label.setToolTip(tooltip)
 
+    def set_progress(self, percent: int | None, message: str = "") -> None:
+        if percent is not None:
+            value = max(0, min(100, int(percent)))
+            self.progress_bar.setValue(value)
+            self.progress_bar.setFormat(f"{value}%")
+        if message:
+            self.set_status(message)
+
     def set_selected_look(self, selected: bool) -> None:
         self.setProperty("selectedRow", selected)
         self.style().unpolish(self)
@@ -453,8 +437,7 @@ class ConversionRowWidget(QWidget):
         if event.button() == Qt.LeftButton:
             row = self.list_widget.row(self.item)
             if row >= 0:
-                modifiers = event.modifiers()
-                if modifiers & Qt.ControlModifier:
+                if event.modifiers() & Qt.ControlModifier:
                     self.item.setSelected(not self.item.isSelected())
                     self.list_widget.setCurrentRow(row)
                 else:
@@ -557,6 +540,8 @@ def convert_media(
     resolution: str = "Original",
     quality: str = "Equilibrada",
     fat32_mode: bool = False,
+    audio_bitrate_kbps: int | None = None,
+    cover_image_path: Path | None = None,
 ) -> None:
     """Convert with selectable resolution/quality and an optional FAT32-aware two-pass encode.
 
@@ -577,17 +562,41 @@ def convert_media(
     quality = quality if quality in VIDEO_QUALITY_SETTINGS else "Equilibrada"
     quality_settings = VIDEO_QUALITY_SETTINGS[quality]
     duration = _probe_duration(source)
-    is_audio_output = fmt == "mp3"
+    is_audio_output = fmt in {value.lower() for value in AUDIO_OUTPUT_FORMATS}
     use_fat32_target = bool(fat32_mode and not is_audio_output)
+    use_cover = bool(fmt == "mp3" and cover_image_path and cover_image_path.is_file())
 
     base = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(source)]
+    if use_cover:
+        base += ["-i", str(cover_image_path)]
     progress_args = ["-progress", "pipe:1", "-stats_period", "1", "-nostats"]
     audio_bitrate = int(quality_settings["audio_kbps"])
 
-    if fmt == "mp3":
-        video_args: list[str] = ["-vn"]
-        audio_args = ["-c:a", "libmp3lame", "-b:a", f"{audio_bitrate}k"]
+    selected_audio_bitrate = max(32, min(512, int(audio_bitrate_kbps or audio_bitrate)))
+    if is_audio_output:
+        video_args: list[str] = ["-map", "0:a:0", "-map_metadata", "0"]
+        if use_cover:
+            video_args += ["-map", "1:v:0", "-c:v", "copy", "-disposition:v:0", "attached_pic",
+                           "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+        # YouTube's bestaudio download normally has no attached-picture stream.
+        # Do not map optional cover art here: FFmpeg builds vary in support for
+        # the attached_pic metadata selector, and the map can abort conversion.
         format_args: list[str] = []
+        if fmt == "mp3":
+            audio_args = ["-c:a", "libmp3lame", "-b:a", f"{selected_audio_bitrate}k", "-id3v2_version", "3"]
+        elif fmt == "flac":
+            audio_args = ["-c:a", "flac", "-compression_level", "8"]
+        elif fmt == "wav":
+            audio_args = ["-c:a", "pcm_s16le"]
+        elif fmt == "m4a":
+            audio_args = ["-c:a", "aac", "-b:a", f"{selected_audio_bitrate}k"]
+        elif fmt == "aac":
+            audio_args = ["-c:a", "aac", "-b:a", f"{selected_audio_bitrate}k"]
+            format_args = ["-f", "adts"]
+        elif fmt == "ogg":
+            audio_args = ["-c:a", "libvorbis", "-q:a", "5"]
+        elif fmt == "opus":
+            audio_args = ["-c:a", "libopus", "-b:a", f"{selected_audio_bitrate}k"]
     elif fmt in ("mp4", "mkv", "mpg", "avi"):
         video_args = ["-map", "0:v:0", "-sn", "-dn", "-threads", "0"]
         audio_args = ["-map", "0:a:0?", "-c:a"]
@@ -696,7 +705,10 @@ def convert_media(
             stderr_file.flush()
             stderr_file.seek(max(0, stderr_file.tell() - 12000))
             details = stderr_file.read().decode("utf-8", errors="replace").strip()
-            raise RuntimeError(details[-5000:] or f"FFmpeg terminó con código {return_code}.")
+            raise RuntimeError(
+                (details[-5000:] + f"\\nArchivo de origen: {source}\\nArchivo de salida: {command[-1]}")
+                if details else f"FFmpeg terminó con código {return_code}.\\nOrigen: {source}\\nSalida: {command[-1]}"
+            )
 
     try:
         if use_fat32_target:
@@ -705,8 +717,8 @@ def convert_media(
                     "No pude detectar la duración del video para calcular el tamaño FAT32. "
                     "Desactiva la optimización FAT32 o vuelve a comprobar el archivo."
                 )
-            if fmt == "mp3":
-                raise RuntimeError("La optimización FAT32 de video no se aplica a archivos MP3.")
+            if is_audio_output:
+                raise RuntimeError("La optimización FAT32 no se aplica a archivos de audio.")
 
             target_gib = float(quality_settings["fat32_gib"])
             target_bytes = int(target_gib * (1024 ** 3))
@@ -934,7 +946,10 @@ class DownloadWorker(QThread):
                 title = str(info.get("title") or self.task["url"])
                 self.task["media_id"] = str(info.get("id") or "")
                 if title:
-                    self.metadata.emit(task_id, title, b"")
+                    thumbnail_bytes = self.task.get("preview_thumbnail", b"")
+                    if not thumbnail_bytes:
+                        thumbnail_bytes = DownloadPreviewWorker._thumbnail_bytes(info, ydl)
+                    self.metadata.emit(task_id, title, thumbnail_bytes or b"")
                 if self.isInterruptionRequested():
                     raise OperationCancelled("Descarga cancelada por el usuario.")
                 result_info = ydl.process_ie_result(info, download=True)
@@ -1104,8 +1119,143 @@ class ThumbnailWorker(QThread):
                 continue
 
 
+
+
+class PlaylistSelectionDialog(QDialog):
+    """Let the user choose individual entries from a detected playlist."""
+
+    def __init__(self, entries: list[dict], selected_video_id: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Seleccionar videos de la lista")
+        self.setMinimumSize(680, 520)
+        self.entries = [entry for entry in entries if isinstance(entry, dict)]
+        layout = QVBoxLayout(self)
+        heading = QLabel("Se detectó una lista de reproducción")
+        heading.setObjectName("cardTitle")
+        layout.addWidget(heading)
+        note = QLabel("El video del enlace aparece marcado inicialmente. Marca los demás videos que quieras agregar a la cola.")
+        note.setObjectName("mutedLabel")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        actions = QHBoxLayout()
+        select_all = QPushButton("Seleccionar todos")
+        select_none = QPushButton("Desmarcar todos")
+        actions.addWidget(select_all)
+        actions.addWidget(select_none)
+        actions.addStretch(1)
+        self.count_label = QLabel()
+        self.count_label.setObjectName("countPill")
+        actions.addWidget(self.count_label)
+        layout.addLayout(actions)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setIconSize(QSize(112, 63))
+        self.list_widget.setSpacing(3)
+        layout.addWidget(self.list_widget, 1)
+        first_checked = False
+        for entry in self.entries:
+            title = str(entry.get("title") or entry.get("id") or "Video sin título")
+            duration = _format_clock(entry.get("duration"))
+            item = QListWidgetItem(title + "   ·   " + duration)
+            item.setToolTip(str(entry.get("webpage_url") or entry.get("url") or title))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            entry_id = str(entry.get("id") or "")
+            is_current = bool(selected_video_id and entry_id == selected_video_id)
+            if is_current and not first_checked:
+                item.setCheckState(Qt.Checked)
+                first_checked = True
+            else:
+                item.setCheckState(Qt.Unchecked)
+            thumb = entry.get("_mediaflow_thumbnail")
+            if isinstance(thumb, bytes) and thumb:
+                pixmap = QPixmap()
+                if pixmap.loadFromData(thumb):
+                    item.setIcon(QIcon(_center_crop_pixmap(pixmap, QSize(112, 63))))
+            self.list_widget.addItem(item)
+        if self.entries and not first_checked:
+            self.list_widget.item(0).setCheckState(Qt.Checked)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancelar")
+        accept = QPushButton("Agregar seleccionados")
+        accept.setObjectName("primaryButton")
+        buttons.addWidget(cancel)
+        buttons.addWidget(accept)
+        layout.addLayout(buttons)
+        select_all.clicked.connect(lambda: self._set_all(Qt.Checked))
+        select_none.clicked.connect(lambda: self._set_all(Qt.Unchecked))
+        cancel.clicked.connect(self.reject)
+        accept.clicked.connect(self.accept)
+        self.list_widget.itemChanged.connect(self._update_count)
+        self._update_count()
+
+    def _set_all(self, state) -> None:
+        for index in range(self.list_widget.count()):
+            self.list_widget.item(index).setCheckState(state)
+
+    def _update_count(self, *_args) -> None:
+        selected = sum(
+            self.list_widget.item(index).checkState() == Qt.Checked
+            for index in range(self.list_widget.count())
+        )
+        self.count_label.setText(f"{selected} seleccionados")
+
+    def selected_entries(self) -> list[dict]:
+        return [
+            self.entries[index]
+            for index in range(min(len(self.entries), self.list_widget.count()))
+            if self.list_widget.item(index).checkState() == Qt.Checked
+        ]
+
+
+
+
+class AudioCoverWorker(QThread):
+    """Extract embedded album artwork without blocking the music workspace."""
+    coverReady = Signal(str, bytes)
+
+    def __init__(self, sources: list[Path]):
+        super().__init__()
+        self.sources = list(sources)
+
+    def run(self) -> None:
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            return
+        cache_dir = _thumbnail_cache_directory()
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        for source in self.sources:
+            if self.isInterruptionRequested():
+                break
+            try:
+                stat = source.stat()
+                identity = f"audio-cover|{source.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+                digest = hashlib.sha256(identity.encode("utf-8", errors="replace")).hexdigest()[:24]
+                cover = cache_dir / f"{digest}.jpg"
+                if not cover.is_file():
+                    result = subprocess.run(
+                        [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+                         "-map", "0:v:0", "-frames:v", "1", "-q:v", "3", str(cover)],
+                        capture_output=True, timeout=20,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    if result.returncode != 0 or not cover.is_file() or cover.stat().st_size == 0:
+                        cover.unlink(missing_ok=True)
+                        continue
+                data = cover.read_bytes()
+                if data:
+                    self.coverReady.emit(str(source), data)
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+
 class DownloadPreviewWorker(QThread):
-    """Fetch title, metadata and a thumbnail before a queued download starts."""
+    """Fetch video title and thumbnail before a queued download starts."""
     ready = Signal(str, str, bytes, object)
     failed = Signal(str, str)
 
@@ -1115,25 +1265,45 @@ class DownloadPreviewWorker(QThread):
         self.url = url
 
     @staticmethod
-    def _thumbnail_bytes(info: dict) -> bytes:
-        thumb_url = info.get("thumbnail")
-        if not thumb_url:
-            for thumbnail_info in reversed(info.get("thumbnails") or []):
-                if isinstance(thumbnail_info, dict) and thumbnail_info.get("url"):
-                    thumb_url = thumbnail_info["url"]
-                    break
-        if not thumb_url:
-            return b""
-        try:
-            request = urllib.request.Request(
-                thumb_url,
-                headers={"User-Agent": "Mozilla/5.0 MediaFlow/0.4.3"},
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
-                data = response.read(4 * 1024 * 1024)
-            return data if data else b""
-        except Exception:
-            return b""
+    def _thumbnail_bytes(info: dict, ydl=None) -> bytes:
+        candidates: list[str] = []
+        primary = info.get("thumbnail")
+        if isinstance(primary, str) and primary:
+            candidates.append(primary)
+        thumbnails = [
+            item for item in (info.get("thumbnails") or [])
+            if isinstance(item, dict) and isinstance(item.get("url"), str) and item["url"]
+        ]
+        thumbnails.sort(
+            key=lambda item: (
+                int(item.get("preference") or 0),
+                int(item.get("width") or 0) * int(item.get("height") or 0),
+            ),
+            reverse=True,
+        )
+        candidates.extend(item["url"] for item in thumbnails)
+        seen: set[str] = set()
+        for thumb_url in candidates:
+            if thumb_url in seen:
+                continue
+            seen.add(thumb_url)
+            try:
+                request = urllib.request.Request(
+                    thumb_url,
+                    headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"},
+                )
+                if ydl is not None:
+                    # yt-dlp's opener uses its own configured socket timeout.
+                    with ydl.urlopen(request) as response:
+                        data = response.read(4 * 1024 * 1024 + 1)
+                else:
+                    with urllib.request.urlopen(request, timeout=15) as response:
+                        data = response.read(4 * 1024 * 1024 + 1)
+                if data and len(data) <= 4 * 1024 * 1024:
+                    return data
+            except Exception:
+                continue
+        return b""
 
     def run(self) -> None:
         try:
@@ -1148,27 +1318,159 @@ class DownloadPreviewWorker(QThread):
             options = {
                 "quiet": True,
                 "no_warnings": True,
-                "noplaylist": True,
+                "noplaylist": False,
                 "skip_download": True,
-                "socket_timeout": 20,
-                "retries": 1,
+                "cachedir": False,
+                "socket_timeout": 25,
+                "retries": 2,
+                "extractor_retries": 3,
+                "file_access_retries": 2,
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
+                    "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
+                },
             }
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(self.url, download=False)
+                if self.isInterruptionRequested():
+                    return
+                if not isinstance(info, dict):
+                    raise RuntimeError("YouTube no devolvió información del video. Comprueba que el enlace sea público y válido.")
+                if info.get("_type") == "playlist":
+                    entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+                    # Hydrate entries that yt-dlp returned as flat playlist items.
+                    hydrated: list[dict] = []
+                    for entry in entries[:60]:
+                        if self.isInterruptionRequested():
+                            return
+                        current = entry
+                        if not current.get("title") or not current.get("thumbnail"):
+                            entry_url = current.get("webpage_url") or current.get("url")
+                            if entry_url and str(entry_url).startswith(("http://", "https://")):
+                                try:
+                                    detailed = ydl.extract_info(str(entry_url), download=False)
+                                    if isinstance(detailed, dict):
+                                        current = {**current, **detailed}
+                                except Exception:
+                                    pass
+                        current["_mediaflow_thumbnail"] = self._thumbnail_bytes(current, ydl)
+                        hydrated.append(current)
+                    info["entries"] = hydrated + entries[len(hydrated):]
+                    title = str(info.get("title") or "Lista de reproducción")
+                    thumb_data = b""
+                else:
+                    title = str(info.get("title") or info.get("id") or self.url)
+                    thumb_data = self._thumbnail_bytes(info, ydl)
             if self.isInterruptionRequested():
                 return
-            if not isinstance(info, dict):
-                raise RuntimeError("El sitio no devolvió información válida del contenido.")
-            title = str(info.get("title") or self.url)
-            thumb_data = self._thumbnail_bytes(info)
             self.ready.emit(self.task_id, title, thumb_data, info)
         except Exception as exc:
             if not self.isInterruptionRequested():
-                self.failed.emit(self.task_id, str(exc))
+                self.failed.emit(self.task_id, f"No se pudo analizar el enlace de YouTube: {exc}")
+
+
+class MusicUrlDownloadWorker(QThread):
+    progress = Signal(int, str)
+    succeeded = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal(str)
+
+    def __init__(self, url: str, output_dir: Path, output_format: str, bitrate: int):
+        super().__init__()
+        self.url, self.output_dir = url, output_dir
+        self.output_format, self.bitrate = output_format.lower(), int(bitrate)
+
+    def _progress_hook(self, data: dict) -> None:
+        if self.isInterruptionRequested():
+            raise OperationCancelled("Descarga cancelada por el usuario.")
+        if data.get("status") == "downloading":
+            downloaded = data.get("downloaded_bytes", 0) or 0
+            total = data.get("total_bytes") or data.get("total_bytes_estimate")
+            pct = int(downloaded * 75 / total) if total else 5
+            self.progress.emit(max(0, min(75, pct)), "Descargando audio de YouTube…")
+        elif data.get("status") == "finished":
+            self.progress.emit(78, "Audio recibido; preparando conversión…")
+
+    def run(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp(prefix="mediaflow-audio-"))
+        source = None
+        try:
+            deno = find_deno()
+            if deno:
+                deno_dir = str(Path(deno).parent)
+                current = os.environ.get("PATH", "")
+                if deno_dir.lower() not in current.lower().split(os.pathsep):
+                    os.environ["PATH"] = deno_dir + os.pathsep + current
+            from yt_dlp import YoutubeDL
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            options = {
+                "format": "bestaudio/best",
+                "outtmpl": str(temp_dir / "%(title).150B [%(id)s].%(ext)s"),
+                "writethumbnail": True,
+                "postprocessors": [{"key": "FFmpegThumbnailsConvertor", "format": "jpg"}],
+                "noplaylist": True, "windowsfilenames": True,
+                "quiet": True, "no_warnings": True,
+                "progress_hooks": [self._progress_hook],
+                "retries": 3, "fragment_retries": 3, "socket_timeout": 30,
+            }
+            ffmpeg = find_ffmpeg()
+            if ffmpeg:
+                options["ffmpeg_location"] = str(Path(ffmpeg).parent)
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(self.url, download=True)
+                if self.isInterruptionRequested():
+                    raise OperationCancelled("Descarga cancelada.")
+                if not isinstance(info, dict):
+                    raise RuntimeError("YouTube no devolvió información válida.")
+                prepared = Path(ydl.prepare_filename(info))
+                candidates = [prepared] + [prepared.with_suffix(ext) for ext in (".webm", ".m4a", ".mp4", ".opus", ".mp3")]
+                vid = str(info.get("id") or "")
+                if vid:
+                    candidates += [p for p in temp_dir.glob(f"*[{vid}]*") if p.is_file()]
+                source = next((p for p in candidates if p.is_file() and p.stat().st_size), None)
+                if source is None:
+                    raise RuntimeError("No localicé el audio descargado.")
+                title = str(info.get("title") or source.stem)
+                cover_candidates = [p for p in temp_dir.glob("*") if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg"}]
+                if vid:
+                    cover_candidates.sort(key=lambda p: (vid in p.name, p.stat().st_mtime), reverse=True)
+                cover_image = cover_candidates[0] if cover_candidates else None
+            if self.isInterruptionRequested():
+                raise OperationCancelled("Descarga cancelada.")
+            destination = unique_output_path(self.output_dir, title, self.output_format)
+            self.progress.emit(80, f"Convirtiendo a {self.output_format.upper()} · {self.bitrate} kbps…")
+            def report(pct, detail):
+                shown = 80 if pct is None else 80 + int(max(0, min(100, pct)) * .19)
+                self.progress.emit(min(99, shown), f"Convirtiendo audio · {detail}")
+            convert_media(source, destination, self.output_format, report,
+                          cancel_check=self.isInterruptionRequested,
+                          audio_bitrate_kbps=self.bitrate,
+                          cover_image_path=cover_image)
+            try:
+                source.unlink()
+            except OSError:
+                pass
+            self.progress.emit(100, "Descarga y conversión completadas.")
+            self.succeeded.emit(str(destination))
+        except Exception as exc:
+            if self.isInterruptionRequested() or isinstance(exc, OperationCancelled):
+                if source and source.exists():
+                    try: source.unlink()
+                    except OSError: pass
+                self.cancelled.emit("Descarga de música cancelada.")
+            else:
+                self.failed.emit(str(exc))
+        finally:
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except OSError:
+                pass
 
 
 class ConvertWorker(QThread):
     progress = Signal(int, str)
+    fileProgress = Signal(str, int, str)
     succeeded = Signal(str)
     failed = Signal(str)
     cancelled = Signal(str)
@@ -1176,13 +1478,14 @@ class ConvertWorker(QThread):
     fileSucceeded = Signal(str, str)
     fileFailed = Signal(str, str)
 
-    def __init__(self, jobs: list[tuple[Path, str, str, str, bool]], output_dir: Path):
+    def __init__(self, jobs: list[tuple[Path, str, str, str, bool]], output_dir: Path, audio_bitrate_kbps: int | None = None):
         super().__init__()
         self.jobs = [
             (Path(source), str(output_format).lower(), str(resolution), str(quality), bool(fat32_mode))
             for source, output_format, resolution, quality, fat32_mode in jobs
         ]
         self.output_dir = output_dir
+        self.audio_bitrate_kbps = audio_bitrate_kbps
         self._cancel_lock = threading.Lock()
         self._cancelled_paths: set[str] = set()
         self._finished_paths: set[str] = set()
@@ -1248,6 +1551,8 @@ class ConvertWorker(QThread):
 
                 def report_file_progress(percent: int | None, detail: str) -> None:
                     overall = int((index - 1) * 100 / total) if percent is None else int(((index - 1) + (percent / 100)) * 100 / total)
+                    shown = min(99, max(0, int(percent or 0)))
+                    self.fileProgress.emit(str(source), shown, detail)
                     self.progress.emit(
                         min(99, max(0, overall)),
                         f"Archivo {index}/{total}: {source.name} · {detail}",
@@ -1259,6 +1564,7 @@ class ConvertWorker(QThread):
                     resolution=resolution,
                     quality=quality,
                     fat32_mode=fat32_mode,
+                    audio_bitrate_kbps=self.audio_bitrate_kbps,
                 )
                 results.append(str(destination))
                 self.fileSucceeded.emit(str(source), str(destination))
@@ -1307,7 +1613,14 @@ class MediaFlowWindow(QMainWindow):
         self.active_worker: DownloadWorker | None = None
         self.preview_worker: DownloadPreviewWorker | None = None
         self.preview_queue: list[str] = []
+        self.download_queue_started = False
         self.conversion_worker: ConvertWorker | None = None
+        self.music_worker: ConvertWorker | None = None
+        self.music_download_worker: MusicUrlDownloadWorker | None = None
+        self.music_files: list[Path] = []
+        self.music_items_by_path: dict[str, QListWidgetItem] = {}
+        self.music_cover_worker: AudioCoverWorker | None = None
+        self.music_cover_pending: list[Path] = []
         self.folder_scan_worker: FolderScanWorker | None = None
         self.thumbnail_worker: ThumbnailWorker | None = None
         self.thumbnail_pending: list[Path] = []
@@ -1380,10 +1693,14 @@ class MediaFlowWindow(QMainWindow):
         self.download_nav_button.setObjectName("navButton")
         self.download_nav_button.setCheckable(True)
         self.download_nav_button.setChecked(True)
+        self.music_nav_button = QPushButton("♫  Música")
+        self.music_nav_button.setObjectName("navButton")
+        self.music_nav_button.setCheckable(True)
         self.convert_nav_button = QPushButton("▣  Convertir local")
         self.convert_nav_button.setObjectName("navButton")
         self.convert_nav_button.setCheckable(True)
         nav_layout.addWidget(self.download_nav_button)
+        nav_layout.addWidget(self.music_nav_button)
         nav_layout.addWidget(self.convert_nav_button)
         header.addWidget(nav_group, 0, Qt.AlignVCenter)
         header.addStretch(1)
@@ -1419,10 +1736,12 @@ class MediaFlowWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.setMovable(False)
         self.tabs.addTab(self._build_download_page(), "Descargar")
+        self.tabs.addTab(self._build_music_page(), "Música")
         self.tabs.addTab(self._build_convert_page(), "Convertir local")
         self.tabs.tabBar().hide()
         self.download_nav_button.clicked.connect(lambda: self.tabs.setCurrentIndex(0))
-        self.convert_nav_button.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
+        self.music_nav_button.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
+        self.convert_nav_button.clicked.connect(lambda: self.tabs.setCurrentIndex(2))
         self.tabs.currentChanged.connect(self._sync_navigation_buttons)
         outer.addWidget(self.tabs, 1)
 
@@ -1439,7 +1758,8 @@ class MediaFlowWindow(QMainWindow):
 
     def _sync_navigation_buttons(self, index: int) -> None:
         self.download_nav_button.setChecked(index == 0)
-        self.convert_nav_button.setChecked(index == 1)
+        self.music_nav_button.setChecked(index == 1)
+        self.convert_nav_button.setChecked(index == 2)
 
     # ------------------------------------------------------------------
     # GitHub Releases updater
@@ -1859,7 +2179,7 @@ class MediaFlowWindow(QMainWindow):
 
         download_action_row = QHBoxLayout()
         download_action_row.addStretch(1)
-        self.download_add_button = QPushButton("↓  DESCARGAR")
+        self.download_add_button = QPushButton("⌕  Procesar video")
         self.download_add_button.setObjectName("primaryButton")
         self.download_add_button.setMinimumHeight(40)
         self.download_add_button.setMinimumWidth(190)
@@ -1903,7 +2223,7 @@ class MediaFlowWindow(QMainWindow):
         qtitle.setObjectName("cardTitle")
         qhead.addWidget(qtitle)
         qhead.addStretch(1)
-        queue_note = QLabel("Miniatura · título · formato · progreso")
+        queue_note = QLabel("Miniatura · título · duración · formato · progreso")
         queue_note.setObjectName("finePrint")
         qhead.addWidget(queue_note)
         queue_layout.addLayout(qhead)
@@ -1934,9 +2254,9 @@ class MediaFlowWindow(QMainWindow):
         queue_layout.addWidget(self.queue_table, 1)
 
         controls_row = QHBoxLayout()
-        self.start_queue_button = QPushButton("▶  Iniciar cola")
+        self.start_queue_button = QPushButton("↓  Iniciar descarga")
         self.start_queue_button.setObjectName("primaryButton")
-        self.start_queue_button.clicked.connect(self._start_next_download)
+        self.start_queue_button.clicked.connect(self._start_download_queue)
         controls_row.addWidget(self.start_queue_button)
         self.cancel_download_button = QPushButton("✕  Cancelar seleccionadas")
         self.cancel_download_button.setObjectName("dangerButton")
@@ -1958,6 +2278,315 @@ class MediaFlowWindow(QMainWindow):
         layout.addWidget(queue_card, 1)
         return page
 
+
+    def _build_music_page(self) -> QWidget:
+        page = DropTarget()
+        page.filesDropped.connect(self._handle_music_dropped_files)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(2, 9, 2, 2)
+        layout.setSpacing(10)
+        intro = QHBoxLayout()
+        intro_text = QVBoxLayout()
+        heading = QLabel("Música y audio")
+        heading.setObjectName("pageTitle")
+        intro_text.addWidget(heading)
+        description = QLabel("Convierte tus archivos de audio a formatos de alta calidad. Los archivos originales no se modifican.")
+        description.setObjectName("mutedLabel")
+        intro_text.addWidget(description)
+        intro.addLayout(intro_text)
+        intro.addStretch(1)
+        self.music_count = QLabel("0 archivos")
+        self.music_count.setObjectName("countPill")
+        intro.addWidget(self.music_count)
+        layout.addLayout(intro)
+        card = QFrame()
+        card.setObjectName("surfaceCard")
+        body = QVBoxLayout(card)
+        body.setContentsMargins(15, 13, 15, 13)
+        body.setSpacing(9)
+        title = QLabel("Biblioteca de trabajo")
+        title.setObjectName("cardTitle")
+        body.addWidget(title)
+        url_row = QHBoxLayout()
+        self.music_url_input = QLineEdit()
+        self.music_url_input.setPlaceholderText("Pega aquí un enlace de YouTube para descargar su audio…")
+        self.music_url_input.setClearButtonEnabled(True)
+        self.music_url_input.returnPressed.connect(self._start_music_url_download)
+        url_row.addWidget(self.music_url_input, 1)
+        paste_music = QPushButton("Pegar")
+        paste_music.clicked.connect(self._paste_music_url)
+        url_row.addWidget(paste_music)
+        self.music_url_download_button = QPushButton("↓ Descargar audio")
+        self.music_url_download_button.setObjectName("secondaryAccentButton")
+        self.music_url_download_button.clicked.connect(self._start_music_url_download)
+        url_row.addWidget(self.music_url_download_button)
+        body.addLayout(url_row)
+        self.music_list = QListWidget()
+        self.music_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.music_list.setMinimumHeight(260)
+        self.music_list.setAlternatingRowColors(True)
+        self.music_list.setIconSize(QSize(56, 56))
+        body.addWidget(self.music_list, 1)
+        file_actions = QHBoxLayout()
+        add_files = QPushButton("＋ Agregar archivos")
+        add_files.clicked.connect(self._choose_music_files)
+        file_actions.addWidget(add_files)
+        remove_files = QPushButton("Quitar seleccionados")
+        remove_files.clicked.connect(self._remove_music_files)
+        file_actions.addWidget(remove_files)
+        clear_files = QPushButton("Limpiar lista")
+        clear_files.clicked.connect(self._clear_music_files)
+        file_actions.addWidget(clear_files)
+        file_actions.addStretch(1)
+        body.addLayout(file_actions)
+        settings = QGridLayout()
+        settings.addWidget(self._small_label("FORMATO DE SALIDA"), 0, 0)
+        self.music_format = QComboBox()
+        self.music_format.addItems(AUDIO_OUTPUT_FORMATS)
+        self.music_format.setCurrentText("MP3")
+        settings.addWidget(self.music_format, 1, 0)
+        settings.addWidget(self._small_label("CALIDAD / BITRATE"), 0, 1)
+        self.music_bitrate = QComboBox()
+        self.music_bitrate.addItems(["96 kbps", "128 kbps", "192 kbps", "256 kbps", "320 kbps"])
+        self.music_bitrate.setCurrentText("320 kbps")
+        settings.addWidget(self.music_bitrate, 1, 1)
+        settings.addWidget(self._small_label("CARPETA DE DESTINO"), 0, 2)
+        destination_row = QHBoxLayout()
+        self.music_destination = QLineEdit(str(MUSIC_OUTPUT_DIR))
+        self.music_destination.setReadOnly(True)
+        destination_row.addWidget(self.music_destination, 1)
+        choose_destination = QPushButton("Cambiar")
+        choose_destination.clicked.connect(self._choose_music_destination)
+        destination_row.addWidget(choose_destination)
+        settings.addLayout(destination_row, 1, 2)
+        settings.setColumnStretch(2, 2)
+        body.addLayout(settings)
+        actions = QHBoxLayout()
+        self.music_convert_button = QPushButton("♫  CONVERTIR AUDIO")
+        self.music_convert_button.setObjectName("primaryButton")
+        self.music_convert_button.clicked.connect(self._start_music_conversion)
+        actions.addWidget(self.music_convert_button)
+        self.music_open_button = QPushButton("Abrir carpeta")
+        self.music_open_button.clicked.connect(lambda: self._open_folder(Path(self.music_destination.text())))
+        actions.addWidget(self.music_open_button)
+        actions.addStretch(1)
+        body.addLayout(actions)
+        self.music_progress = QProgressBar()
+        self.music_progress.setValue(0)
+        body.addWidget(self.music_progress)
+        self.music_status = QLabel("Pega un enlace de YouTube o agrega archivos de audio propios. Elige formato y calidad antes de comenzar.")
+        self.music_status.setObjectName("mutedLabel")
+        self.music_status.setWordWrap(True)
+        body.addWidget(self.music_status)
+        layout.addWidget(card, 1)
+        return page
+
+    def _paste_music_url(self) -> None:
+        self.music_url_input.setText(QApplication.clipboard().text().strip())
+
+    def _start_music_url_download(self) -> None:
+        if self.music_download_worker is not None and self.music_download_worker.isRunning():
+            return
+        url = self.music_url_input.text().strip()
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            QMessageBox.warning(self, "Enlace no válido", "Pega un enlace completo de YouTube.")
+            return
+        if not any(host in parsed.netloc.lower() for host in ("youtube.com", "youtu.be", "youtube-nocookie.com")):
+            QMessageBox.warning(self, "Sitio no compatible", "Esta función acepta enlaces de YouTube.")
+            return
+        if not find_ffmpeg():
+            QMessageBox.warning(self, "FFmpeg no detectado", "Instala FFmpeg y vuelve a abrir MediaFlow.")
+            return
+        fmt = self.music_format.currentText().lower()
+        bitrate = int(self.music_bitrate.currentText().split()[0])
+        self.music_url_download_button.setEnabled(False)
+        self.music_format.setEnabled(False)
+        self.music_bitrate.setEnabled(False)
+        self.music_progress.setValue(0)
+        self.music_status.setText(f"Descargando audio · {fmt.upper()} · {bitrate} kbps.")
+        worker = MusicUrlDownloadWorker(url, Path(self.music_destination.text()), fmt, bitrate)
+        self.music_download_worker = worker
+        worker.progress.connect(self._music_url_progress)
+        worker.succeeded.connect(self._music_url_succeeded)
+        worker.failed.connect(self._music_url_failed)
+        worker.cancelled.connect(self._music_url_cancelled)
+        worker.finished.connect(self._music_url_finished)
+        worker.start()
+
+    def _music_url_progress(self, percent: int, message: str) -> None:
+        self.music_progress.setValue(percent)
+        self.music_status.setText(message)
+
+    def _music_url_succeeded(self, path: str) -> None:
+        self.music_progress.setValue(100)
+        self.music_status.setText(f"Audio guardado: {Path(path).name}\nCarpeta: {self.music_destination.text()}")
+
+    def _music_url_failed(self, message: str) -> None:
+        self.music_status.setText("No se pudo descargar el audio: " + message[:1200])
+
+    def _music_url_cancelled(self, message: str) -> None:
+        self.music_status.setText(message)
+
+    def _music_url_finished(self) -> None:
+        worker = self.music_download_worker
+        self.music_download_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.music_url_download_button.setEnabled(True)
+        self.music_format.setEnabled(True)
+        self.music_bitrate.setEnabled(True)
+
+    def _choose_music_files(self) -> None:
+        names, _ = QFileDialog.getOpenFileNames(
+            self, "Seleccionar archivos de audio", str(Path.home()),
+            "Archivos de audio (*.mp3 *.flac *.wav *.m4a *.aac *.ogg *.opus *.wma *.aiff *.alac);;Todos los archivos (*.*)"
+        )
+        self._add_music_paths([Path(name) for name in names])
+
+    def _handle_music_dropped_files(self, raw_paths: list[str]) -> None:
+        self._add_music_paths([Path(raw) for raw in raw_paths])
+
+    def _add_music_paths(self, paths: list[Path]) -> None:
+        added = 0
+        newly_added: list[Path] = []
+        known = {str(path.resolve()).casefold() for path in self.music_files}
+        for path in paths:
+            candidates = []
+            if path.is_dir():
+                try:
+                    candidates = [item for item in path.rglob("*") if item.is_file() and item.suffix.lower() in AUDIO_EXTENSIONS]
+                except OSError:
+                    candidates = []
+            elif path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
+                candidates = [path]
+            for candidate in candidates:
+                try:
+                    key = str(candidate.resolve()).casefold()
+                    if key in known:
+                        continue
+                    self.music_files.append(candidate)
+                    item = QListWidgetItem(f"{candidate.name}    ·    {human_file_size(candidate.stat().st_size)}")
+                    item.setToolTip(str(candidate))
+                    item.setIcon(QIcon(_placeholder_pixmap(QSize(56, 56), "♫")))
+                    self.music_list.addItem(item)
+                    self.music_items_by_path[key] = item
+                    newly_added.append(candidate)
+                    known.add(key)
+                    added += 1
+                except OSError:
+                    continue
+        self.music_count.setText(f"{len(self.music_files)} archivos")
+        if added:
+            self.music_status.setText(f"Se agregaron {added} archivo(s) de audio. Buscando portadas incrustadas…")
+            self.music_cover_pending.extend(newly_added)
+            self._start_music_cover_worker()
+
+    def _remove_music_files(self) -> None:
+        for index in sorted({item.row() for item in self.music_list.selectedIndexes()}, reverse=True):
+            item = self.music_list.takeItem(index)
+            if 0 <= index < len(self.music_files):
+                path = self.music_files.pop(index)
+                self.music_items_by_path.pop(str(path.resolve()).casefold(), None)
+        self.music_count.setText(f"{len(self.music_files)} archivos")
+
+    def _clear_music_files(self) -> None:
+        if self.music_worker is not None and self.music_worker.isRunning():
+            return
+        self.music_files.clear()
+        self.music_list.clear()
+        self.music_items_by_path.clear()
+        self.music_cover_pending.clear()
+        self.music_count.setText("0 archivos")
+        self.music_progress.setValue(0)
+        self.music_status.setText("Lista vacía.")
+
+
+    def _start_music_cover_worker(self) -> None:
+        if self.music_cover_worker is not None and self.music_cover_worker.isRunning():
+            return
+        if not self.music_cover_pending:
+            return
+        batch = self.music_cover_pending
+        self.music_cover_pending = []
+        worker = AudioCoverWorker(batch)
+        self.music_cover_worker = worker
+        worker.coverReady.connect(self._on_music_cover_ready)
+        worker.finished.connect(self._music_cover_worker_finished)
+        worker.start()
+
+    def _on_music_cover_ready(self, raw_path: str, image_bytes: bytes) -> None:
+        key = str(Path(raw_path).resolve()).casefold()
+        item = self.music_items_by_path.get(key)
+        if item is None:
+            return
+        pixmap = QPixmap()
+        if pixmap.loadFromData(image_bytes):
+            item.setIcon(QIcon(_center_crop_pixmap(pixmap, QSize(56, 56))))
+            item.setToolTip(raw_path + "\nPortada incrustada disponible")
+
+    def _music_cover_worker_finished(self) -> None:
+        worker = self.music_cover_worker
+        self.music_cover_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if self.music_cover_pending:
+            QTimer.singleShot(100, self._start_music_cover_worker)
+
+    def _choose_music_destination(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Carpeta de salida para música", self.music_destination.text())
+        if folder:
+            self.music_destination.setText(folder)
+
+    def _start_music_conversion(self) -> None:
+        if self.music_worker is not None and self.music_worker.isRunning():
+            return
+        if not self.music_files:
+            QMessageBox.information(self, "No hay archivos", "Agrega archivos de audio antes de convertir.")
+            return
+        if not find_ffmpeg():
+            QMessageBox.warning(self, "FFmpeg no detectado", "Instala FFmpeg y vuelve a abrir MediaFlow.")
+            return
+        bitrate = int(self.music_bitrate.currentText().split()[0])
+        output_format = self.music_format.currentText().lower()
+        jobs = [(source, output_format, "Original", "Alta", False) for source in self.music_files]
+        self.music_convert_button.setEnabled(False)
+        self.music_format.setEnabled(False)
+        self.music_bitrate.setEnabled(False)
+        self.music_progress.setValue(0)
+        self.music_worker = ConvertWorker(jobs, Path(self.music_destination.text()), audio_bitrate_kbps=bitrate)
+        self.music_worker.progress.connect(self._music_progress)
+        self.music_worker.succeeded.connect(self._music_succeeded)
+        self.music_worker.failed.connect(self._music_failed)
+        self.music_worker.cancelled.connect(self._music_cancelled)
+        self.music_worker.finished.connect(self._music_conversion_finished)
+        self.music_status.setText(f"Convirtiendo {len(jobs)} archivo(s) a {output_format.upper()} · {bitrate} kbps.")
+        self.music_worker.start()
+
+    def _music_progress(self, percent: int, message: str) -> None:
+        self.music_progress.setValue(percent)
+        self.music_status.setText(message)
+
+    def _music_succeeded(self, results: str) -> None:
+        count = len([line for line in results.splitlines() if line.strip()])
+        if count:
+            self.music_status.setText(f"Conversión terminada: {count} archivo(s). Destino: {self.music_destination.text()}")
+
+    def _music_failed(self, message: str) -> None:
+        self.music_status.setText("Algunos archivos no pudieron convertirse: " + message[:1200])
+
+    def _music_cancelled(self, message: str) -> None:
+        self.music_status.setText(message)
+
+    def _music_conversion_finished(self) -> None:
+        worker = self.music_worker
+        self.music_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        self.music_convert_button.setEnabled(True)
+        self.music_format.setEnabled(True)
+        self.music_bitrate.setEnabled(True)
+
     def _build_convert_page(self) -> QWidget:
         page = DropTarget()
         page.filesDropped.connect(self._handle_dropped_files)
@@ -1971,7 +2600,7 @@ class MediaFlowWindow(QMainWindow):
         header = QLabel("Convertir archivos locales")
         header.setObjectName("pageTitle")
         intro_text.addWidget(header)
-        sub = QLabel("Agrega archivos o carpetas completas. Las miniaturas y el análisis se preparan en segundo plano.")
+        sub = QLabel("Agrega archivos o carpetas completas y sigue el avance individual de cada conversión.")
         sub.setObjectName("mutedLabel")
         intro_text.addWidget(sub)
         intro.addLayout(intro_text)
@@ -2014,7 +2643,7 @@ class MediaFlowWindow(QMainWindow):
         file_label.setObjectName("cardTitle")
         file_header.addWidget(file_label)
         file_header.addStretch(1)
-        thumb_hint = QLabel("Cada fila mantiene su miniatura, ruta y formato individual")
+        thumb_hint = QLabel("Cada archivo muestra su propia barra de progreso y formato")
         thumb_hint.setObjectName("finePrint")
         file_header.addWidget(thumb_hint)
         file_layout.addLayout(file_header)
@@ -2022,7 +2651,7 @@ class MediaFlowWindow(QMainWindow):
         self.file_list = QListWidget()
         self.file_list.setObjectName("conversionList")
         self.file_list.setMinimumHeight(220)
-        self.file_list.setIconSize(QSize(116, 66))
+        self.file_list.setIconSize(QSize(1, 1))
         self.file_list.setSpacing(5)
         self.file_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.file_list.setUniformItemSizes(False)
@@ -2190,9 +2819,6 @@ class MediaFlowWindow(QMainWindow):
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             QMessageBox.warning(self, "Enlace no válido", "Pega un enlace web completo que comience con http:// o https://.")
             return
-        if not find_ffmpeg():
-            QMessageBox.warning(self, "FFmpeg no detectado", "Instala FFmpeg y vuelve a abrir MediaFlow para descargar y convertir.")
-            return
         output_format = self.format_combo.currentText()
         auto_convert = self.auto_convert.isChecked()
         if not auto_convert and output_format in ("MPG", "AVI", "MP3"):
@@ -2216,8 +2842,9 @@ class MediaFlowWindow(QMainWindow):
             "output_format": output_format,
             "auto_convert": auto_convert,
             "rate_kbps": self.speed_limit.value(),
-            "status": "Pendiente",
+            "status": "Procesando información",
             "path": "",
+            "duration": None,
         }
         self.tasks[task_id] = task
         row = self.queue_table.rowCount()
@@ -2231,10 +2858,10 @@ class MediaFlowWindow(QMainWindow):
         title_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.queue_table.setItem(row, 0, title_item)
         download_cell = DownloadQueueCell(
-            f"{parsed.netloc} · preparando miniatura…",
+            f"{parsed.netloc} · analizando video…",
             "AUDIO" if quality == "Solo audio" else "VIDEO",
         )
-        download_cell.set_subtitle(f"{quality}  ·  {output_format}  ·  Pendiente")
+        download_cell.set_subtitle(f"{quality}  ·  {output_format}  ·  Procesando información…")
         self.queue_table.setCellWidget(row, 0, download_cell)
         self.download_cells[task_id] = download_cell
         quality_item = QTableWidgetItem(quality)
@@ -2271,14 +2898,14 @@ class MediaFlowWindow(QMainWindow):
         progress_host_layout.addWidget(progress, 1, Qt.AlignVCenter)
         self.queue_table.setCellWidget(row, 3, progress_host)
         self.download_progress_bars[task_id] = progress
-        for column, value in ((4, "—"), (5, "—"), (6, "Pendiente")):
+        for column, value in ((4, "—"), (5, "—"), (6, "Procesando")):
             cell_item = QTableWidgetItem(value)
             cell_item.setTextAlignment(Qt.AlignCenter)
             self.queue_table.setItem(row, column, cell_item)
         self.queue_table.setRowHeight(row, 72)
         self.task_rows[task_id] = row
         self.url_input.clear()
-        self.queue_status.setText(f"Se agregó una descarga. Estamos obteniendo su miniatura; formato final: {output_format}.")
+        self.queue_status.setText(f"Procesando información del video: título, miniatura y duración. Formato final: {output_format}.")
         self._refresh_summary()
         self.preview_queue.append(task_id)
         self._start_next_download_preview()
@@ -2340,17 +2967,66 @@ class MediaFlowWindow(QMainWindow):
         row = self.task_rows.get(task_id)
         if task is None or row is None:
             return
+        if isinstance(info, dict) and info.get("_type") == "playlist":
+            entries = [entry for entry in (info.get("entries") or []) if isinstance(entry, dict)]
+            parsed_url = urlparse(task.get("url", ""))
+            selected_id = parse_qs(parsed_url.query).get("v", [""])[0]
+            if not selected_id and parsed_url.netloc.lower().endswith("youtu.be"):
+                selected_id = parsed_url.path.strip("/").split("/")[0]
+            dialog = PlaylistSelectionDialog(entries, selected_id, self)
+            dialog.setWindowTitle(f"MediaFlow · {title}")
+            chosen = dialog.exec()
+            # Replace the temporary parent row with one queue item per selected video.
+            self.queue_table.removeRow(row)
+            self.tasks.pop(task_id, None)
+            self.task_rows.pop(task_id, None)
+            self.download_cells.pop(task_id, None)
+            self.download_format_editors.pop(task_id, None)
+            self.download_progress_bars.pop(task_id, None)
+            self._reindex_rows()
+            if chosen == QDialog.Accepted:
+                selected_entries = dialog.selected_entries()
+                added = 0
+                for entry in selected_entries:
+                    video_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+                    if not video_url.startswith(("http://", "https://")):
+                        entry_id = str(entry.get("id") or "").strip()
+                        if entry_id and str(entry.get("ie_key") or "").lower() in ("youtube", "youtubeplaylist"):
+                            video_url = f"https://www.youtube.com/watch?v={entry_id}"
+                    if not video_url:
+                        continue
+                    self.url_input.setText(video_url)
+                    self._add_download()
+                    added += 1
+                self.queue_status.setText(
+                    f"Se agregaron {added} videos seleccionados de «{title}» a la cola."
+                    if added else "No se agregaron videos: no se encontraron enlaces individuales válidos."
+                )
+            else:
+                self.queue_status.setText("Selección de lista cancelada; no se agregó ningún video.")
+            self._refresh_summary()
+            return
         if isinstance(info, dict):
             task["preview_info"] = info
+        task["preview_thumbnail"] = image_bytes or b""
         item = self.queue_table.item(row, 0)
         task["title"] = title
+        duration = info.get("duration") if isinstance(info, dict) else None
+        try:
+            task["duration"] = float(duration) if duration is not None else None
+        except (TypeError, ValueError):
+            task["duration"] = None
         if item:
             item.setToolTip(task["url"] + ("\nMiniatura disponible" if image_bytes else "\nEl sitio no proporcionó miniatura."))
         cell = self.download_cells.get(task_id)
         if cell is not None:
             cell.set_title(title)
-            cell.set_subtitle(f"{task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  Miniatura {'lista' if image_bytes else 'no disponible'}")
+            duration_label = _format_clock(task.get("duration"))
+            cell.set_subtitle(f"{duration_label}  ·  {task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  Listo para descargar")
             cell.set_thumbnail_bytes(image_bytes)
+        self._set_task_status(task_id, "Pendiente")
+        self.queue_status.setText(f"Video procesado: {title}. Ya puedes agregar más enlaces o iniciar la descarga.")
+        self._refresh_summary()
 
     def _on_download_preview_failed(self, task_id: str, message: str) -> None:
         row = self.task_rows.get(task_id)
@@ -2363,7 +3039,9 @@ class MediaFlowWindow(QMainWindow):
         if cell is not None:
             task = self.tasks.get(task_id, {})
             cell.set_subtitle(f"{task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  Miniatura no disponible")
-        self.queue_status.setText("No se pudo obtener la miniatura de una descarga. Puedes intentar descargarla igualmente.")
+        self._set_task_status(task_id, "Error")
+        self.queue_status.setText("No se pudo procesar este enlace. Revisa el detalle del error en la fila e inténtalo de nuevo.")
+        self._refresh_summary()
 
     def _on_download_preview_finished(self) -> None:
         if self.preview_worker is not None:
@@ -2371,13 +3049,29 @@ class MediaFlowWindow(QMainWindow):
             self.preview_worker = None
         QTimer.singleShot(100, self._start_next_download_preview)
 
+    def _start_download_queue(self) -> None:
+        processing = any(task.get("status") == "Procesando información" for task in self.tasks.values())
+        if processing:
+            self.queue_status.setText("Espera a que termine el procesamiento de todos los enlaces antes de iniciar la descarga.")
+            return
+        if not any(task.get("status") == "Pendiente" for task in self.tasks.values()):
+            self.queue_status.setText("Primero procesa uno o varios videos para agregarlos a la cola.")
+            return
+        if not find_ffmpeg():
+            QMessageBox.warning(self, "FFmpeg no detectado", "Instala FFmpeg y vuelve a abrir MediaFlow para iniciar las descargas y conversiones.")
+            return
+        self.download_queue_started = True
+        self._start_next_download()
+
     def _start_next_download(self) -> None:
+        if not self.download_queue_started:
+            return
         if self.active_worker is not None and self.active_worker.isRunning():
             return
         pending = next((task for task in self.tasks.values() if task["status"] == "Pendiente"), None)
         if pending is None:
-            self.queue_status.setText("La cola terminó. Puedes agregar más enlaces cuando quieras.")
-            self.start_queue_button.setEnabled(False)
+            self.queue_status.setText("La cola terminó. Puedes procesar más enlaces cuando quieras.")
+            self.download_queue_started = False
             self._refresh_summary()
             return
         self.start_queue_button.setEnabled(True)
@@ -2408,7 +3102,8 @@ class MediaFlowWindow(QMainWindow):
         if cell is not None:
             cell.set_title(title)
             cell.set_thumbnail_bytes(image_bytes)
-            cell.set_subtitle(f"{self.tasks[task_id].get('quality', 'Mejor disponible')}  ·  {self.tasks[task_id].get('output_format', 'MPG')}  ·  Descargando")
+            duration_label = _format_clock(self.tasks[task_id].get("duration")) if self.tasks[task_id].get("duration") is not None else "Duración no disponible"
+            cell.set_subtitle(f"{duration_label}  ·  {self.tasks[task_id].get('quality', 'Mejor disponible')}  ·  {self.tasks[task_id].get('output_format', 'MPG')}  ·  Descargando")
 
     def _on_download_progress(self, task_id: str, percent: int, speed: str, eta: str, state: str) -> None:
         row = self.task_rows.get(task_id)
@@ -2436,7 +3131,8 @@ class MediaFlowWindow(QMainWindow):
         cell = self.download_cells.get(task_id)
         if cell is not None:
             task = self.tasks.get(task_id, {})
-            cell.set_subtitle(f"{task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  {status}")
+            duration_label = _format_clock(task.get("duration")) if task.get("duration") is not None else "Duración pendiente"
+            cell.set_subtitle(f"{duration_label}  ·  {task.get('quality', 'Mejor disponible')}  ·  {task.get('output_format', 'MPG')}  ·  {status}")
         if row is not None:
             format_editor = self.download_format_editors.get(task_id)
             if format_editor is not None:
@@ -2482,7 +3178,8 @@ class MediaFlowWindow(QMainWindow):
             self.active_worker.deleteLater()
             self.active_worker = None
         self._refresh_summary()
-        QTimer.singleShot(200, self._start_next_download)
+        if self.download_queue_started:
+            QTimer.singleShot(200, self._start_next_download)
 
     def _cancel_selected_downloads(self) -> None:
         rows = sorted({index.row() for index in self.queue_table.selectionModel().selectedRows()})
@@ -2568,12 +3265,15 @@ class MediaFlowWindow(QMainWindow):
             return
         values = list(self.tasks.values())
         completed = sum(1 for task in values if task["status"] == "Completado")
-        active = sum(1 for task in values if task["status"] in ("Preparando", "Descargando", "Convirtiendo", "Cancelando…"))
+        active = sum(1 for task in values if task["status"] in ("Procesando información", "Preparando", "Descargando", "Convirtiendo", "Cancelando…"))
         self.total_value.setText(str(len(values)))
         self.done_value.setText(str(completed))
         self.active_value.setText(str(active))
         self.queue_summary.setText(f"{len(values)} elementos")
-        self.start_queue_button.setEnabled(any(task["status"] == "Pendiente" for task in values))
+        ready = any(task["status"] == "Pendiente" for task in values)
+        processing = any(task["status"] == "Procesando información" for task in values)
+        running = self.active_worker is not None and self.active_worker.isRunning()
+        self.start_queue_button.setEnabled(ready and not processing and not running)
 
     def _choose_source_files(self) -> None:
         filenames, _ = QFileDialog.getOpenFileNames(
@@ -2646,7 +3346,7 @@ class MediaFlowWindow(QMainWindow):
                         item.setToolTip(str(path))
                         item.setData(Qt.UserRole, str(path))
                         item.setData(Qt.UserRole + 2, self.convert_format.currentText())
-                        item.setSizeHint(QSize(0, 106))
+                        item.setSizeHint(QSize(0, 82))
                         self.file_list.addItem(item)
                         self.file_items_by_path[key] = item
                         row_widget = ConversionRowWidget(
@@ -2660,8 +3360,7 @@ class MediaFlowWindow(QMainWindow):
             except (OSError, PermissionError):
                 continue
         self.convert_count.setText(f"{len(self.selected_files)} archivos")
-        if newly_added:
-            self._queue_thumbnail_generation(newly_added)
+        # La sección Convertir ya no genera miniaturas.
 
     def _queue_thumbnail_generation(self, paths: list[Path]) -> None:
         known = {str(path.resolve()).casefold() for path in self.thumbnail_pending}
@@ -2778,6 +3477,12 @@ class MediaFlowWindow(QMainWindow):
         else:
             self.convert_status.setText("Los archivos seleccionados ya terminaron o no están pendientes de conversión.")
 
+    def _on_conversion_file_progress(self, raw_path: str, percent: int, detail: str) -> None:
+        key = str(Path(raw_path).resolve()).casefold()
+        row_widget = self.conversion_rows_by_path.get(key)
+        if row_widget is not None:
+            row_widget.set_progress(percent, f"Convirtiendo · {detail}")
+
     def _on_conversion_file_cancelled(self, raw_path: str) -> None:
         key = str(Path(raw_path).resolve()).casefold()
         item = self.file_items_by_path.get(key)
@@ -2786,7 +3491,8 @@ class MediaFlowWindow(QMainWindow):
             item.setData(Qt.UserRole + 1, "cancelled")
         row_widget = self.conversion_rows_by_path.get(key)
         if row_widget is not None:
-            row_widget.set_status("Cancelada", "Puedes volver a incluirla en un lote nuevo.")
+            row_widget.set_progress(0, "Cancelada")
+            row_widget.progress_bar.setFormat("Cancelada")
 
     def _on_conversion_file_succeeded(self, raw_source: str, raw_destination: str) -> None:
         key = str(Path(raw_source).resolve()).casefold()
@@ -2813,6 +3519,7 @@ class MediaFlowWindow(QMainWindow):
             else:
                 status = f"Completado · {size_text} · {destination.suffix[1:].upper()}"
                 tooltip = raw_destination
+            row_widget.set_progress(100, status)
             row_widget.set_status(status, tooltip)
 
     def _on_conversion_file_failed(self, raw_source: str, message: str) -> None:
@@ -2820,6 +3527,7 @@ class MediaFlowWindow(QMainWindow):
         row_widget = self.conversion_rows_by_path.get(key)
         if row_widget is not None:
             row_widget.set_status("Error de conversión", message)
+            row_widget.progress_bar.setFormat("Error")
 
     def _remove_selected_files(self) -> None:
         if self.conversion_worker is not None and self.conversion_worker.isRunning():
@@ -2895,6 +3603,8 @@ class MediaFlowWindow(QMainWindow):
             item.setToolTip(str(source))
             row_widget = self.conversion_rows_by_path.get(str(source.resolve()).casefold())
             if row_widget is not None:
+                row_widget.progress_bar.setValue(0)
+                row_widget.progress_bar.setFormat("En cola")
                 row_widget.set_status(
                     f"En cola · {item.data(Qt.UserRole + 2) or self.convert_format.currentText()} · "
                     f"{resolution} · {compression}" + (" · FAT32" if fat32_enabled and (item.data(Qt.UserRole + 2) or self.convert_format.currentText()) != "MP3" else "")
@@ -2910,6 +3620,7 @@ class MediaFlowWindow(QMainWindow):
         self.convert_status.setText(f"Convirtiendo {len(self.selected_files)} archivo(s) · Perfil: {profile_note}. Puedes cancelar el lote sin cerrar MediaFlow.")
         self.conversion_worker = ConvertWorker(jobs, DEFAULT_CONVERTED)
         self.conversion_worker.progress.connect(self._conversion_progress)
+        self.conversion_worker.fileProgress.connect(self._on_conversion_file_progress)
         self.conversion_worker.succeeded.connect(self._conversion_succeeded)
         self.conversion_worker.failed.connect(self._conversion_failed)
         self.conversion_worker.cancelled.connect(self._conversion_cancelled)
@@ -2967,7 +3678,10 @@ class MediaFlowWindow(QMainWindow):
         converting = self.conversion_worker and self.conversion_worker.isRunning()
         scanning = self.folder_scan_worker and self.folder_scan_worker.isRunning()
         thumbnailing = self.thumbnail_worker and self.thumbnail_worker.isRunning()
-        if active or previewing or converting or scanning or thumbnailing:
+        musicing = self.music_worker and self.music_worker.isRunning()
+        music_downloading = self.music_download_worker and self.music_download_worker.isRunning()
+        covering = self.music_cover_worker and self.music_cover_worker.isRunning()
+        if active or previewing or converting or musicing or music_downloading or covering or scanning or thumbnailing:
             answer = QMessageBox.question(
                 self,
                 "Procesos activos",
@@ -2987,6 +3701,15 @@ class MediaFlowWindow(QMainWindow):
             if converting and self.conversion_worker is not None:
                 self.conversion_worker.requestInterruption()
                 self.conversion_worker.wait(8000)
+            if musicing and self.music_worker is not None:
+                self.music_worker.requestInterruption()
+                self.music_worker.wait(8000)
+            if music_downloading and self.music_download_worker is not None:
+                self.music_download_worker.requestInterruption()
+                self.music_download_worker.wait(25000)
+            if covering and self.music_cover_worker is not None:
+                self.music_cover_worker.requestInterruption()
+                self.music_cover_worker.wait(8000)
             if thumbnailing and self.thumbnail_worker is not None:
                 self.thumbnail_worker.requestInterruption()
                 self.thumbnail_worker.wait(25000)

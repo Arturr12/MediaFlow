@@ -38,7 +38,7 @@
 | Gestión de tareas desde una cola. | Conversión mediante FFmpeg. |
 | Miniaturas e información del contenido cuando están disponibles. | Selección de formato y calidad. |
 | Selección de formato y calidad. | Procesamiento de archivos y carpetas. |
-| Seguimiento del progreso. | Perfiles de conversión. |
+| Selección de videos de listas de reproducción. | Perfiles de conversión. |
 
 | Control de tareas | Actualizaciones |
 |---|---|
@@ -55,6 +55,10 @@
 4. Inicia MediaFlow desde Windows.
 
 **Requisitos:** Windows de 64 bits. Consulta las notas de cada versión para conocer los componentes requeridos.
+
+## 🎵 Música y audio
+
+La sección Música permite convertir archivos de audio locales a **MP3, FLAC, WAV, M4A, AAC, OGG y OPUS**, elegir bitrate en los formatos compatibles y conservar metadatos y portadas incrustadas cuando el contenedor lo permite. MediaFlow procesa archivos que tengas derecho a utilizar; no integra servicios de streaming ni descarga catálogos protegidos.
 
 ## 🔄 Actualizaciones automáticas
 
