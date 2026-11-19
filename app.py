@@ -571,17 +571,18 @@ def convert_media(
     selected_audio_bitrate = max(32, min(512, int(audio_bitrate_kbps or audio_bitrate)))
     if is_audio_output:
         video_args: list[str] = ["-map", "0:a:0", "-map_metadata", "0"]
-        if fmt in ("mp3", "flac", "m4a"):
-            video_args += ["-map", "0:v:m:attached_pic?"]
+        # YouTube's bestaudio download normally has no attached-picture stream.
+        # Do not map optional cover art here: FFmpeg builds vary in support for
+        # the attached_pic metadata selector, and the map can abort conversion.
         format_args: list[str] = []
         if fmt == "mp3":
-            audio_args = ["-c:a", "libmp3lame", "-b:a", f"{selected_audio_bitrate}k", "-c:v", "copy", "-id3v2_version", "3"]
+            audio_args = ["-c:a", "libmp3lame", "-b:a", f"{selected_audio_bitrate}k", "-id3v2_version", "3"]
         elif fmt == "flac":
-            audio_args = ["-c:a", "flac", "-compression_level", "8", "-c:v", "copy"]
+            audio_args = ["-c:a", "flac", "-compression_level", "8"]
         elif fmt == "wav":
             audio_args = ["-c:a", "pcm_s16le"]
         elif fmt == "m4a":
-            audio_args = ["-c:a", "aac", "-b:a", f"{selected_audio_bitrate}k", "-c:v", "copy"]
+            audio_args = ["-c:a", "aac", "-b:a", f"{selected_audio_bitrate}k"]
         elif fmt == "aac":
             audio_args = ["-c:a", "aac", "-b:a", f"{selected_audio_bitrate}k"]
             format_args = ["-f", "adts"]
